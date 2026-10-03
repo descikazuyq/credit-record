@@ -279,6 +279,130 @@ func TestWaiverApprovalAndRejectionHistory(t *testing.T) {
 	}
 }
 
+func TestRejectedWaiverResubmitAfterRequirementCreated(t *testing.T) {
+	s := NewStore()
+	mustStudent(t, s, "s1")
+	mustCourse(t, s, "c1", "数学", 4)
+
+	// 目标要求尚不存在：首次申请被拒绝，编号、目标、依据与原因都保留。
+	w, a, err := s.ApplyWaiver("s1", "r1", "w1", "学科竞赛获奖")
+	if err != nil || a != ActionCreated || w.Status != WaiverRejected {
+		t.Fatalf("目标要求不存在应拒绝并保留申请，得到 %+v action=%v err=%v", w, a, err)
+	}
+	origReason := w.Reason
+	if origReason == "" {
+		t.Fatal("拒绝原因应非空")
+	}
+
+	// 后来补建同编号要求。
+	mustReq(t, s, "s1", "r1", "c1")
+
+	// 用原编号、原要求、原依据再次提交：返回最初的已拒绝申请，不新增、不改写。
+	for i := 0; i < 2; i++ {
+		w2, a, err := s.ApplyWaiver("s1", "r1", "w1", "学科竞赛获奖")
+		if err != nil || a != ActionExisted {
+			t.Fatalf("第 %d 次重复提交应幂等返回原申请，得到 action=%v err=%v", i+1, a, err)
+		}
+		if w2.Status != WaiverRejected || w2.ReqID != "r1" || w2.Basis != "学科竞赛获奖" ||
+			w2.Reason != origReason {
+			t.Fatalf("目标补建后重复提交不应改变原拒绝结果，得到 %+v", w2)
+		}
+	}
+	if n := len(s.Waivers("s1")); n != 1 {
+		t.Fatalf("重复提交不应新增申请，免修历史应有 1 条，得到 %d", n)
+	}
+
+	// 核对：没有通过修读也没有有效免修，要求仍未满足，总学分为零，
+	// 被拒绝的旧申请不能成为学分来源。
+	rep := s.CheckStudent("s1")
+	if rep.TotalCredits != 0 {
+		t.Fatalf("被拒绝的申请不应产生学分，总学分=%d", rep.TotalCredits)
+	}
+	if len(rep.Unmet) != 1 || rep.Unmet[0] != "r1" {
+		t.Fatalf("要求 r1 应仍列为未满足，得到 %v", rep.Unmet)
+	}
+	if len(rep.RejectedWaivers) != 1 {
+		t.Fatalf("核对应列出 1 条被拒绝的免修，得到 %d", len(rep.RejectedWaivers))
+	}
+	rj := rep.RejectedWaivers[0]
+	if rj.Waiver.ID != "w1" || rj.Waiver.ReqID != "r1" || rj.Waiver.Basis != "学科竞赛获奖" ||
+		rj.Reason != origReason {
+		t.Fatalf("核对中的被拒绝记录应保持原编号、要求、依据与原因，得到 %+v", rj)
+	}
+
+	// 同编号换要求或换依据：按内容冲突拒绝，原申请与原核对结果不变。
+	mustCourse(t, s, "c2", "物理", 3)
+	mustReq(t, s, "s1", "r2", "c2")
+	if _, _, err := s.ApplyWaiver("s1", "r2", "w1", "学科竞赛获奖"); err == nil {
+		t.Fatal("已拒绝申请同编号换要求应被拒绝")
+	}
+	if _, _, err := s.ApplyWaiver("s1", "r1", "w1", "另一份依据"); err == nil {
+		t.Fatal("已拒绝申请同编号换依据应被拒绝")
+	}
+	if got := s.Waiver("s1", "w1"); got.Status != WaiverRejected ||
+		got.ReqID != "r1" || got.Basis != "学科竞赛获奖" || got.Reason != origReason {
+		t.Fatalf("内容冲突不应改动原申请，得到 %+v", got)
+	}
+	if rep := s.CheckStudent("s1"); rep.TotalCredits != 0 || len(rep.RejectedWaivers) != 1 {
+		t.Fatalf("内容冲突不应改变原核对结果，得到学分=%d 被拒绝=%d",
+			rep.TotalCredits, len(rep.RejectedWaivers))
+	}
+
+	// 目标补建后，用新编号正常申请免修的既有行为不变。
+	w3, a, err := s.ApplyWaiver("s1", "r1", "w2", "外校同层次课程")
+	if err != nil || a != ActionCreated || w3.Status != WaiverApproved {
+		t.Fatalf("补建要求后新编号申请应正常生效，得到 %+v action=%v err=%v", w3, a, err)
+	}
+	rep = s.CheckStudent("s1")
+	if rep.TotalCredits != 4 || len(rep.Unmet) != 1 || rep.Unmet[0] != "r2" {
+		t.Fatalf("新免修应正常计学分，得到学分=%d 未满足=%v", rep.TotalCredits, rep.Unmet)
+	}
+	if len(rep.RejectedWaivers) != 1 || rep.RejectedWaivers[0].Waiver.ID != "w1" {
+		t.Fatalf("旧拒绝记录应继续保留，得到 %+v", rep.RejectedWaivers)
+	}
+}
+
+func TestRejectedWaiverResubmitCrossStudentRequirement(t *testing.T) {
+	s := NewStore()
+	mustStudent(t, s, "s1")
+	mustStudent(t, s, "s2")
+	mustCourse(t, s, "c1", "数学", 4)
+	// 同编号要求只在另一名学生名下存在。
+	mustReq(t, s, "s2", "r1", "c1")
+
+	// 对 s1 而言目标要求不存在：申请被拒绝。
+	w, a, err := s.ApplyWaiver("s1", "r1", "w1", "证明材料")
+	if err != nil || a != ActionCreated || w.Status != WaiverRejected {
+		t.Fatalf("要求属于其他学生应视为不存在并拒绝，得到 %+v action=%v err=%v", w, a, err)
+	}
+	origReason := w.Reason
+	if origReason == "" {
+		t.Fatal("拒绝原因应非空")
+	}
+
+	// 后来 s1 补建自己的同编号要求，再用原内容重复提交：原拒绝结果保留。
+	mustReq(t, s, "s1", "r1", "c1")
+	w2, a, err := s.ApplyWaiver("s1", "r1", "w1", "证明材料")
+	if err != nil || a != ActionExisted || w2.Status != WaiverRejected ||
+		w2.Reason != origReason {
+		t.Fatalf("补建本人要求后重复提交应保留原拒绝结果，得到 %+v action=%v err=%v", w2, a, err)
+	}
+	if n := len(s.Waivers("s1")); n != 1 {
+		t.Fatalf("不应新增申请，s1 免修历史应有 1 条，得到 %d", n)
+	}
+	rep := s.CheckStudent("s1")
+	if rep.TotalCredits != 0 || len(rep.Unmet) != 1 || rep.Unmet[0] != "r1" {
+		t.Fatalf("旧拒绝申请不应满足要求，得到学分=%d 未满足=%v", rep.TotalCredits, rep.Unmet)
+	}
+	if len(rep.RejectedWaivers) != 1 || rep.RejectedWaivers[0].Reason != origReason {
+		t.Fatalf("核对应保留原拒绝记录与原因，得到 %+v", rep.RejectedWaivers)
+	}
+	// s2 的记录不受 s1 申请影响。
+	if rep2 := s.CheckStudent("s2"); len(rep2.RejectedWaivers) != 0 {
+		t.Fatalf("s1 的拒绝记录不应出现在 s2 名下，得到 %+v", rep2.RejectedWaivers)
+	}
+}
+
 func TestWaiverCannotCrossStudent(t *testing.T) {
 	s := NewStore()
 	mustStudent(t, s, "s1")

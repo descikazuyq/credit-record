@@ -168,6 +168,91 @@ func TestCLIRejectedWaiverHistoryPersists(t *testing.T) {
 	}
 }
 
+func TestCLIRejectedWaiverResubmitAfterReqCreated(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	runCLI(t, file, "student", "s1")
+	runCLI(t, file, "course", "c1", "数学", "4")
+
+	// 首次申请：目标要求不存在，退出码 1，内容与原因记入免修历史。
+	out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖")
+	if code != 1 || !strings.Contains(out, "已拒绝") {
+		t.Fatalf("目标要求不存在的首次申请应拒绝且退出码 1，code=%d out=%q", code, out)
+	}
+
+	// 后来补建同编号要求。
+	if _, _, code := runCLI(t, file, "req", "s1", "r1", "c1"); code != 0 {
+		t.Fatal("补建要求失败")
+	}
+
+	// 按相同内容再次提交：沿用重复提交成功的退出码 0，但状态仍为已拒绝，
+	// 不能被当成免修获批。重复执行结果不变。
+	for i := 0; i < 2; i++ {
+		out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖")
+		if code != 0 {
+			t.Fatalf("第 %d 次重复提交应幂等成功，code=%d out=%q", i+1, code, out)
+		}
+		if !strings.Contains(out, "已拒绝") || strings.Contains(out, "有效") {
+			t.Fatalf("重复提交应显示原申请仍为已拒绝，out=%q", out)
+		}
+	}
+
+	// 核对：要求仍未满足，总学分为零，被拒绝记录展示原编号、要求、依据与原因。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 {
+		t.Fatalf("核对失败 code=%d out=%q", code, out)
+	}
+	if !strings.Contains(out, "总学分：0") {
+		t.Fatalf("被拒绝的旧申请不能成为学分来源，out=%q", out)
+	}
+	if !strings.Contains(out, "未满足要求：[r1]") {
+		t.Fatalf("要求 r1 应仍列为未满足，out=%q", out)
+	}
+	if !strings.Contains(out, "被拒绝的免修：") ||
+		!strings.Contains(out, `免修 w1（要求 r1，依据 "学科竞赛获奖"）`) ||
+		!strings.Contains(out, "目标要求 r1 不存在") {
+		t.Fatalf("核对中的被拒绝记录应保留原编号、要求、依据与原因，out=%q", out)
+	}
+
+	// 历史查询同样展示原记录与原因。
+	out, _, code = runCLI(t, file, "show", "s1")
+	if code != 0 {
+		t.Fatalf("show 失败 code=%d out=%q", code, out)
+	}
+	if !strings.Contains(out, `免修 w1：要求 r1，依据 "学科竞赛获奖"，状态：已拒绝`) ||
+		!strings.Contains(out, "目标要求 r1 不存在") {
+		t.Fatalf("show 应展示原拒绝记录与原因，out=%q", out)
+	}
+
+	// 同编号换要求或换依据：按内容冲突明确拒绝，原申请及原核对结果保留。
+	runCLI(t, file, "course", "c2", "物理", "3")
+	runCLI(t, file, "req", "s1", "r2", "c2")
+	if _, errText, code := runCLI(t, file, "waiver", "s1", "r2", "w1", "学科竞赛获奖"); code != 1 {
+		t.Fatalf("同编号换要求应按冲突拒绝，code=%d err=%q", code, errText)
+	}
+	if _, errText, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "另一份依据"); code != 1 {
+		t.Fatalf("同编号换依据应按冲突拒绝，code=%d err=%q", code, errText)
+	}
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：0") ||
+		!strings.Contains(out, "目标要求 r1 不存在") {
+		t.Fatalf("冲突拒绝不应改变原核对结果，code=%d out=%q", code, out)
+	}
+
+	// 目标补建后，用新编号正常申请免修的既有行为不变。
+	out, _, code = runCLI(t, file, "waiver", "s1", "r1", "w2", "外校同层次课程")
+	if code != 0 || !strings.Contains(out, "有效") {
+		t.Fatalf("补建要求后新编号申请应正常生效，code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：4") ||
+		!strings.Contains(out, "来源为有效免修 w2") {
+		t.Fatalf("新免修应正常计学分，code=%d out=%q", code, out)
+	}
+	if !strings.Contains(out, "免修 w1") || !strings.Contains(out, "目标要求 r1 不存在") {
+		t.Fatalf("旧拒绝记录应继续保留在核对结果中，out=%q", out)
+	}
+}
+
 func TestCLIUnknownStudent(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "records.json")
 	runCLI(t, file, "student", "s1")
