@@ -238,6 +238,192 @@ func TestMultiplePassesCountOnceWithEarliestSource(t *testing.T) {
 	}
 }
 
+// TestRevokeWaiverRestoresEarliestSubmittedPassWithRepeatedEnrollment 一项 4
+// 学分要求已有两次通过修读（同一学期、编号不同，登记次序与通过结果提交次序
+// 相反），事后取得有效免修：免修有效时只计一份学分且来源是免修，两次通过
+// 都保留在修读历史中；填写原因撤销后，要求继续满足、总学分不变，来源恢复为
+// 最先提交通过结果的那次修读，而不是按学期、编号或选课登记次序挑选；重复
+// 撤销给出不同原因不能覆盖首次撤销原因，也不能改变已恢复的来源。
+func TestRevokeWaiverRestoresEarliestSubmittedPassWithRepeatedEnrollment(t *testing.T) {
+	s := NewStore()
+	mustStudent(t, s, "s1")
+	mustCourse(t, s, "c1", "高等数学", 4)
+	mustReq(t, s, "s1", "r1", "c1")
+	// 同一学期两次修读：e1 先登记、e2 后登记。
+	mustEnroll(t, s, "s1", "r1", "2024春", "e1")
+	mustEnroll(t, s, "s1", "r1", "2024春", "e2")
+
+	// 通过结果提交次序与登记次序相反：后登记的 e2 先提交通过。
+	if _, _, err := s.SubmitResult("s1", "e2", Passed); err != nil {
+		t.Fatal(err)
+	}
+	if e2 := s.Enrollment("s1", "e2"); e2.ResultSeq == 0 {
+		t.Fatalf("e2 提交通过后应带结果序号，得到 %+v", e2)
+	}
+	if _, _, err := s.SubmitResult("s1", "e1", Passed); err != nil {
+		t.Fatal(err)
+	}
+	if e1 := s.Enrollment("s1", "e1"); e1.ResultSeq <= s.Enrollment("s1", "e2").ResultSeq {
+		t.Fatalf("e1 的提交序号应大于 e2，得到 e1=%d e2=%d",
+			e1.ResultSeq, s.Enrollment("s1", "e2").ResultSeq)
+	}
+
+	// 免修前：4 学分，来源是最先提交的 e2，不是编号/登记次序在前的 e1。
+	repBefore := s.CheckStudent("s1")
+	if repBefore.TotalCredits != 4 || len(repBefore.Unmet) != 0 {
+		t.Fatalf("免修前应满足且 4 学分，得到学分=%d 未满足=%v",
+			repBefore.TotalCredits, repBefore.Unmet)
+	}
+	stBefore := repBefore.Requirements[0]
+	if stBefore.Source != "enrollment" || stBefore.PassedEnrollmentID != "e2" {
+		t.Fatalf("免修前来源应为最先提交通过的 e2，得到 %+v", stBefore)
+	}
+	if got := stBefore.PassedEnrollmentIDs; len(got) != 2 || got[0] != "e2" || got[1] != "e1" {
+		t.Fatalf("通过历史应按提交先后为 [e2 e1]，得到 %v", got)
+	}
+
+	// 事后取得有效免修。
+	w, a, err := s.ApplyWaiver("s1", "r1", "w1", "学科竞赛获奖")
+	if err != nil || a != ActionCreated || w.Status != WaiverApproved {
+		t.Fatalf("免修应生效，得到 %+v action=%v err=%v", w, a, err)
+	}
+	repWaiver := s.CheckStudent("s1")
+	if repWaiver.TotalCredits != 4 {
+		t.Fatalf("免修与两次通过并存只应计一份 4 学分，得到 %d", repWaiver.TotalCredits)
+	}
+	stW := repWaiver.Requirements[0]
+	if stW.Source != "waiver" || stW.WaiverID != "w1" || stW.PassedEnrollmentID != "" {
+		t.Fatalf("免修有效时应以免修说明来源，得到 %+v", stW)
+	}
+	if got := stW.PassedEnrollmentIDs; len(got) != 2 || got[0] != "e2" || got[1] != "e1" {
+		t.Fatalf("免修有效时两次通过仍应保留在修读历史中，得到 %v", got)
+	}
+
+	// 填写原因撤销：要求继续满足、总学分不变，来源恢复为最先提交的 e2。
+	revokeReason := "证明材料复核不通过"
+	rw, changed, err := s.RevokeWaiver("s1", "w1", revokeReason)
+	if err != nil || !changed || rw.Status != WaiverRevoked {
+		t.Fatalf("撤销应成功，changed=%v 得到 %+v err=%v", changed, rw, err)
+	}
+	repAfter := s.CheckStudent("s1")
+	if repAfter.TotalCredits != 4 || len(repAfter.Unmet) != 0 {
+		t.Fatalf("撤销后应继续满足且总学分不变，得到学分=%d 未满足=%v",
+			repAfter.TotalCredits, repAfter.Unmet)
+	}
+	stAfter := repAfter.Requirements[0]
+	if stAfter.Satisfied != stBefore.Satisfied || stAfter.Source != stBefore.Source ||
+		stAfter.PassedEnrollmentID != stBefore.PassedEnrollmentID {
+		t.Fatalf("撤销后来源应恢复为免修前的判定，免修前 %+v，撤销后 %+v",
+			stBefore, stAfter)
+	}
+	if got := stAfter.PassedEnrollmentIDs; len(got) != 2 || got[0] != "e2" || got[1] != "e1" {
+		t.Fatalf("撤销后两次通过的提交先后应保持原样，得到 %v", got)
+	}
+	if len(repAfter.RevokedWaivers) != 1 || repAfter.RevokedWaivers[0] != "w1" {
+		t.Fatalf("核对应列出已撤销免修 w1，得到 %v", repAfter.RevokedWaivers)
+	}
+	// 免修历史保留原编号、指向要求、原依据与本次撤销原因。
+	if got := s.Waiver("s1", "w1"); got.Status != WaiverRevoked || got.ReqID != "r1" ||
+		got.Basis != "学科竞赛获奖" || got.Reason != revokeReason {
+		t.Fatalf("免修历史应原样保留并记录撤销原因，得到 %+v", got)
+	}
+	// 通过修读的结果与提交序号保持原样。
+	if e := s.Enrollment("s1", "e1"); e.Result != Passed || e.Term != "2024春" {
+		t.Fatalf("e1 应保持原通过结果，得到 %+v", e)
+	}
+	if e := s.Enrollment("s1", "e2"); e.Result != Passed || e.Term != "2024春" {
+		t.Fatalf("e2 应保持原通过结果，得到 %+v", e)
+	}
+
+	// 用不同原因重复撤销：返回原结果，首次原因与已恢复的来源都不变。
+	rw2, changed2, err := s.RevokeWaiver("s1", "w1", "后来补充的另一个原因")
+	if err != nil || changed2 || rw2.Reason != revokeReason {
+		t.Fatalf("重复撤销应原样返回且不覆盖原因，changed=%v 得到 %+v err=%v",
+			changed2, rw2, err)
+	}
+	repRepeat := s.CheckStudent("s1")
+	stRepeat := repRepeat.Requirements[0]
+	if repRepeat.TotalCredits != 4 || stRepeat.Source != "enrollment" ||
+		stRepeat.PassedEnrollmentID != "e2" {
+		t.Fatalf("重复撤销后学分来源应仍为最先提交的 e2，得到 %+v", stRepeat)
+	}
+	if got := s.Waiver("s1", "w1"); got.Status != WaiverRevoked || got.Reason != revokeReason {
+		t.Fatalf("首次撤销原因应保留，得到 %+v", got)
+	}
+}
+
+// TestRevokeWaiverWithoutPassReturnsUnmetAndKeepsOtherRequirements 撤销前只有
+// 选课与未通过修读、没有任何通过记录时，撤销免修后该要求回到未满足并失去
+// 原先提供的一份课程学分；已撤销免修与未通过修读都不能再作为来源，选课与
+// 未通过记录仍可查；同一名学生其他要求的满足情况与学分不变。
+func TestRevokeWaiverWithoutPassReturnsUnmetAndKeepsOtherRequirements(t *testing.T) {
+	s := NewStore()
+	mustStudent(t, s, "s1")
+	mustCourse(t, s, "c1", "高等数学", 4)
+	mustCourse(t, s, "c2", "大学物理", 3)
+	mustReq(t, s, "s1", "r1", "c1")
+	mustReq(t, s, "s1", "r2", "c2")
+	// r1：一份选课、一份未通过，没有任何通过记录。
+	mustEnroll(t, s, "s1", "r1", "2024春", "e1")
+	mustEnroll(t, s, "s1", "r1", "2024秋", "e2")
+	// r2：正常通过。
+	mustEnroll(t, s, "s1", "r2", "2025春", "e3")
+	if _, _, err := s.SubmitResult("s1", "e2", Failed); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SubmitResult("s1", "e3", Passed); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyWaiver("s1", "r1", "w1", "外校同层次课程"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 撤销前：r1 免修 4 学分 + r2 通过 3 学分。
+	rep := s.CheckStudent("s1")
+	if rep.TotalCredits != 7 || len(rep.Unmet) != 0 {
+		t.Fatalf("撤销前总学分应为 7 且全部满足，得到学分=%d 未满足=%v",
+			rep.TotalCredits, rep.Unmet)
+	}
+	r2Before := rep.Requirements[1]
+	if r2Before.Source != "enrollment" || r2Before.PassedEnrollmentID != "e3" {
+		t.Fatalf("撤销前 r2 应由 e3 通过满足，得到 %+v", r2Before)
+	}
+
+	if _, changed, err := s.RevokeWaiver("s1", "w1", "依据材料不被承认"); err != nil || !changed {
+		t.Fatalf("撤销应成功，changed=%v err=%v", changed, err)
+	}
+
+	rep = s.CheckStudent("s1")
+	if rep.TotalCredits != 3 {
+		t.Fatalf("撤销后应失去免修提供的 4 学分、只剩 r2 的 3 学分，得到 %d", rep.TotalCredits)
+	}
+	if len(rep.Unmet) != 1 || rep.Unmet[0] != "r1" {
+		t.Fatalf("r1 无通过记录应重新列为未满足，得到 %v", rep.Unmet)
+	}
+	r1 := rep.Requirements[0]
+	if r1.Satisfied || r1.Source != "" || r1.WaiverID != "" || r1.PassedEnrollmentID != "" ||
+		len(r1.PassedEnrollmentIDs) != 0 {
+		t.Fatalf("r1 应未满足且无任何来源（已撤销免修与未通过修读都不可用），得到 %+v", r1)
+	}
+	if len(rep.RevokedWaivers) != 1 || rep.RevokedWaivers[0] != "w1" {
+		t.Fatalf("已撤销免修应单列，得到 %v", rep.RevokedWaivers)
+	}
+	// 其他要求的满足情况与学分不变。
+	r2After := rep.Requirements[1]
+	if r2After.Satisfied != r2Before.Satisfied || r2After.Source != r2Before.Source ||
+		r2After.PassedEnrollmentID != r2Before.PassedEnrollmentID {
+		t.Fatalf("撤销不应改变 r2，撤销前 %+v 撤销后 %+v", r2Before, r2After)
+	}
+
+	// 选课与未通过记录仍可查、结果原样保留。
+	if e := s.Enrollment("s1", "e1"); e == nil || e.Result != Enrolled || e.Term != "2024春" {
+		t.Fatalf("选课记录 e1 应仍可查且保持选课，得到 %+v", e)
+	}
+	if e := s.Enrollment("s1", "e2"); e == nil || e.Result != Failed || e.Term != "2024秋" {
+		t.Fatalf("未通过记录 e2 应仍可查且保持未通过，得到 %+v", e)
+	}
+}
+
 func TestWaiverApprovalAndRejectionHistory(t *testing.T) {
 	s := NewStore()
 	mustStudent(t, s, "s1")

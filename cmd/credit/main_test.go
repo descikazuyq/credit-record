@@ -511,6 +511,321 @@ func TestCLISharedEnrollmentResultOwnershipReversed(t *testing.T) {
 	}
 }
 
+// checkLine 执行 check 并返回输出中包含 sub 的第一行；找不到时失败。
+func checkLine(t *testing.T, file, student, sub string) string {
+	t.Helper()
+	out, _, code := runCLI(t, file, "check", student)
+	if code != 0 {
+		t.Fatalf("check %s 失败 code=%d out=%q", student, code, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, sub) {
+			return line
+		}
+	}
+	t.Fatalf("check %s 输出中找不到 %q：%s", student, sub, out)
+	return ""
+}
+
+// TestCLIRevokeWaiverRestoresFirstSubmittedPassSource 一项 4 学分要求已有两次
+// 通过修读（同一学期、编号不同，选课登记次序与通过结果提交次序相反），之后
+// 取得有效免修：免修有效时只贡献 4 学分、来源是免修且两次通过都留在修读
+// 历史中；用户填写原因撤销后，要求继续满足、总学分不变，来源恢复为最先
+// 提交通过结果的那次修读，不能按学期、编号或选课登记次序重新挑选；通过
+// 结果与提交先后保持原样，免修历史保留原编号、指向要求、原依据与撤销原因。
+func TestCLIRevokeWaiverRestoresFirstSubmittedPassSource(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	for _, st := range [][]string{
+		{"student", "s1"},
+		{"course", "c1", "高等数学", "4"},
+		{"req", "s1", "r1", "c1"},
+		// 同一学期两次修读：先登记 e1，再登记 e2。
+		{"enroll", "s1", "r1", "2024春", "e1"},
+		{"enroll", "s1", "r1", "2024春", "e2"},
+	} {
+		if _, errText, code := runCLI(t, file, st...); code != 0 {
+			t.Fatalf("步骤 %v 应成功，code=%d err=%q", st, code, errText)
+		}
+	}
+
+	// 通过结果提交次序与登记次序相反：后登记的 e2 先提交通过。
+	if _, errText, code := runCLI(t, file, "pass", "s1", "e2"); code != 0 {
+		t.Fatalf("e2 提交通过应成功，code=%d err=%q", code, errText)
+	}
+	if _, errText, code := runCLI(t, file, "pass", "s1", "e1"); code != 0 {
+		t.Fatalf("e1 提交通过应成功，code=%d err=%q", code, errText)
+	}
+
+	// 免修生效前：要求已满足、4 学分，来源是最先提交通过的 e2
+	//（而不是编号或登记次序在前的 e1），修读历史按提交先后为 [e2 e1]。
+	lineBefore := checkLine(t, file, "s1", "要求 r1")
+	if !strings.Contains(lineBefore, "来源为通过修读 e2") ||
+		!strings.Contains(lineBefore, "共通过 2 次") {
+		t.Fatalf("免修前应按最先提交结果的 e2 说明来源，行=%q", lineBefore)
+	}
+	if strings.Contains(lineBefore, "通过修读 e1（") {
+		t.Fatalf("不应按编号或登记次序选 e1 作为来源，行=%q", lineBefore)
+	}
+
+	// 事后取得有效免修。
+	if out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖"); code != 0 ||
+		!strings.Contains(out, "免修 w1 有效") {
+		t.Fatalf("免修应生效，code=%d out=%q", code, out)
+	}
+
+	// 免修有效时：仍只贡献 4 学分，来源是这份免修，两次通过都保留在
+	// 修读历史中，顺序仍按提交先后。
+	out, _, code := runCLI(t, file, "check", "s1")
+	if code != 0 {
+		t.Fatalf("免修有效时核对失败：%s", out)
+	}
+	if !strings.Contains(out, "总学分：4") {
+		t.Fatalf("免修与两次通过并存只应计一份 4 学分，out=%q", out)
+	}
+	lineWaiver := checkLine(t, file, "s1", "要求 r1")
+	if !strings.Contains(lineWaiver, "来源为有效免修 w1") {
+		t.Fatalf("免修有效时应以免修说明来源，行=%q", lineWaiver)
+	}
+	if !strings.Contains(lineWaiver, "通过修读历史 [e2 e1]") {
+		t.Fatalf("两次通过应保留在修读历史且按提交先后排列，行=%q", lineWaiver)
+	}
+
+	// 用户撤销免修并填写原因。
+	revokeReason := "证明材料复核不通过"
+	if out, _, code := runCLI(t, file, "revoke-waiver", "s1", "w1", revokeReason); code != 0 ||
+		!strings.Contains(out, "免修 w1 已撤销") {
+		t.Fatalf("撤销免修应成功，code=%d out=%q", code, out)
+	}
+
+	// 撤销后：要求继续满足、总学分不变，来源恢复为最先提交通过的 e2，
+	// 且与免修生效前的核对结论逐字一致。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 {
+		t.Fatalf("撤销后核对失败：%s", out)
+	}
+	if !strings.Contains(out, "总学分：4") {
+		t.Fatalf("撤销后有两次通过应继续满足且总学分仍为 4，out=%q", out)
+	}
+	if strings.Contains(out, "未满足要求：[") {
+		t.Fatalf("撤销后不应出现未满足要求，out=%q", out)
+	}
+	lineAfter := checkLine(t, file, "s1", "要求 r1")
+	if lineAfter != lineBefore {
+		t.Fatalf("撤销后学分来源应与免修前逐字一致\n免修前：%q\n撤销后：%q",
+			lineBefore, lineAfter)
+	}
+	if !strings.Contains(out, "已撤销免修：[w1]") {
+		t.Fatalf("核对应列出已撤销免修 w1，out=%q", out)
+	}
+	if strings.Contains(out, "来源为有效免修 w1") {
+		t.Fatalf("已撤销免修不能继续作为学分来源，out=%q", out)
+	}
+
+	// 通过修读的结果与提交先后保持原样；免修历史保留原编号、指向要求、
+	// 原依据与本次撤销原因，并呈现已撤销状态。
+	out, _, code = runCLI(t, file, "show", "s1")
+	if code != 0 {
+		t.Fatalf("show 失败：%s", out)
+	}
+	for _, enrID := range []string{"e1", "e2"} {
+		if !strings.Contains(out,
+			"修读 "+enrID+"：要求 r1，学期 2024春，结果：通过") {
+			t.Fatalf("修读 %s 应仍可查且结果保持通过，out=%q", enrID, out)
+		}
+	}
+	wantWaiverLine := `免修 w1：要求 r1，依据 "学科竞赛获奖"，状态：已撤销（` + revokeReason + "）"
+	if !strings.Contains(out, wantWaiverLine) {
+		t.Fatalf("免修历史应保留原编号、要求、依据、撤销原因与已撤销状态\n需要包含 %q\nout=%q",
+			wantWaiverLine, out)
+	}
+}
+
+// TestCLIRevokeWaiverWithoutPassReturnsUnmet 撤销前要求只有选课与未通过修读、
+// 没有任何通过记录时，撤销免修后该要求应回到未满足并失去它原先提供的一份
+// 课程学分；核对不能继续使用已撤销免修或未通过修读作为来源，选课与未通过
+// 记录仍可查；同一名学生其他要求的满足情况与学分不受影响。
+func TestCLIRevokeWaiverWithoutPassReturnsUnmet(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	for _, st := range [][]string{
+		{"student", "s1"},
+		{"course", "c1", "高等数学", "4"},
+		{"course", "c2", "大学物理", "3"},
+		{"req", "s1", "r1", "c1"},
+		{"req", "s1", "r2", "c2"},
+		// r1：一份选课、一份未通过，没有任何通过记录。
+		{"enroll", "s1", "r1", "2024春", "e1"},
+		{"enroll", "s1", "r1", "2024秋", "e2"},
+		// r2：正常通过，撤销 r1 的免修不应影响它。
+		{"enroll", "s1", "r2", "2025春", "e3"},
+	} {
+		if _, errText, code := runCLI(t, file, st...); code != 0 {
+			t.Fatalf("步骤 %v 应成功，code=%d err=%q", st, code, errText)
+		}
+	}
+	if _, errText, code := runCLI(t, file, "fail", "s1", "e2"); code != 0 {
+		t.Fatalf("e2 提交未通过应成功，code=%d err=%q", code, errText)
+	}
+	if _, errText, code := runCLI(t, file, "pass", "s1", "e3"); code != 0 {
+		t.Fatalf("e3 提交通过应成功，code=%d err=%q", code, errText)
+	}
+
+	// r1 由有效免修满足：总学分 7（免修 4 + 通过修读 3）。
+	if out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "外校同层次课程"); code != 0 ||
+		!strings.Contains(out, "免修 w1 有效") {
+		t.Fatalf("免修应生效，code=%d out=%q", code, out)
+	}
+	out, _, code := runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：7") {
+		t.Fatalf("免修有效时总学分应为 7，code=%d out=%q", code, out)
+	}
+	if !strings.Contains(checkLine(t, file, "s1", "要求 r1"), "来源为有效免修 w1") {
+		t.Fatalf("撤销前 r1 应以免修说明来源，out=%q", out)
+	}
+	lineR2Before := checkLine(t, file, "s1", "要求 r2")
+	if !strings.Contains(lineR2Before, "来源为通过修读 e3") {
+		t.Fatalf("撤销前 r2 应由 e3 通过满足，行=%q", lineR2Before)
+	}
+
+	// 撤销 r1 的免修并填写原因。
+	revokeReason := "依据材料不被承认"
+	if out, _, code := runCLI(t, file, "revoke-waiver", "s1", "w1", revokeReason); code != 0 ||
+		!strings.Contains(out, "免修 w1 已撤销") {
+		t.Fatalf("撤销免修应成功，code=%d out=%q", code, out)
+	}
+
+	// r1 回到未满足，失去原先的 4 学分；r2 的 3 学分保持不变。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 {
+		t.Fatalf("撤销后核对失败：%s", out)
+	}
+	if !strings.Contains(out, "总学分：3") {
+		t.Fatalf("撤销后总学分应为 3（只剩 r2 的通过），out=%q", out)
+	}
+	if !strings.Contains(out, "未满足要求：[r1]") {
+		t.Fatalf("无通过记录的 r1 应重新列为未满足，out=%q", out)
+	}
+	lineR1 := checkLine(t, file, "s1", "要求 r1")
+	if !strings.Contains(lineR1, "未满足") || strings.Contains(lineR1, "来源") {
+		t.Fatalf("r1 应未满足且没有任何来源（不能用已撤销免修或未通过修读），行=%q", lineR1)
+	}
+	if !strings.Contains(out, "已撤销免修：[w1]") {
+		t.Fatalf("已撤销免修应在核对中单列，out=%q", out)
+	}
+	if strings.Contains(out, "来源为有效免修 w1") ||
+		strings.Contains(out, "来源为通过修读 e1") ||
+		strings.Contains(out, "来源为通过修读 e2") {
+		t.Fatalf("已撤销免修、选课与未通过修读都不能作为来源，out=%q", out)
+	}
+	// 其他要求的满足情况逐字不变。
+	if lineR2After := checkLine(t, file, "s1", "要求 r2"); lineR2After != lineR2Before {
+		t.Fatalf("撤销不应改变 r2 的核对结论\n撤销前：%q\n撤销后：%q",
+			lineR2Before, lineR2After)
+	}
+
+	// 选课、未通过与已撤销免修记录仍然可查。
+	out, _, code = runCLI(t, file, "show", "s1")
+	if code != 0 {
+		t.Fatalf("show 失败：%s", out)
+	}
+	if !strings.Contains(out, "修读 e1：要求 r1，学期 2024春，结果：选课") {
+		t.Fatalf("选课记录 e1 应仍可查，out=%q", out)
+	}
+	if !strings.Contains(out, "修读 e2：要求 r1，学期 2024秋，结果：未通过") {
+		t.Fatalf("未通过记录 e2 应仍可查，out=%q", out)
+	}
+	if !strings.Contains(out, "修读 e3：要求 r2，学期 2025春，结果：通过") {
+		t.Fatalf("r2 的通过记录 e3 应保持不变，out=%q", out)
+	}
+	wantWaiverLine := `免修 w1：要求 r1，依据 "外校同层次课程"，状态：已撤销（` + revokeReason + "）"
+	if !strings.Contains(out, wantWaiverLine) {
+		t.Fatalf("免修历史应保留原编号、要求、依据、撤销原因与已撤销状态\n需要包含 %q\nout=%q",
+			wantWaiverLine, out)
+	}
+}
+
+// TestCLIRevokedWaiverRepeatRevokeKeepsFirstReason 同一份已撤销免修再次被撤销
+// 时返回原结果：后来给出的不同原因不能覆盖首次撤销原因，也不能改变已经恢复
+// 的学分来源；按原内容重新申请同样不会让已撤销申请重新生效。
+func TestCLIRevokedWaiverRepeatRevokeKeepsFirstReason(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	for _, st := range [][]string{
+		{"student", "s1"},
+		{"course", "c1", "高等数学", "4"},
+		{"req", "s1", "r1", "c1"},
+		{"enroll", "s1", "r1", "2024春", "e1"},
+		{"enroll", "s1", "r1", "2024春", "e2"},
+	} {
+		if _, errText, code := runCLI(t, file, st...); code != 0 {
+			t.Fatalf("步骤 %v 应成功，code=%d err=%q", st, code, errText)
+		}
+	}
+	// 后登记的 e2 先提交通过，e1 后提交。
+	if _, errText, code := runCLI(t, file, "pass", "s1", "e2"); code != 0 {
+		t.Fatalf("e2 提交通过应成功，code=%d err=%q", code, errText)
+	}
+	if _, errText, code := runCLI(t, file, "pass", "s1", "e1"); code != 0 {
+		t.Fatalf("e1 提交通过应成功，code=%d err=%q", code, errText)
+	}
+	lineBefore := checkLine(t, file, "s1", "要求 r1")
+	if out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖"); code != 0 {
+		t.Fatalf("免修申请应成功，out=%q", out)
+	}
+
+	firstReason := "首次撤销原因"
+	if out, _, code := runCLI(t, file, "revoke-waiver", "s1", "w1", firstReason); code != 0 ||
+		!strings.Contains(out, "免修 w1 已撤销") {
+		t.Fatalf("首次撤销应成功，code=%d out=%q", code, out)
+	}
+	// 撤销后来源恢复为最先提交通过的 e2。
+	if line := checkLine(t, file, "s1", "要求 r1"); line != lineBefore {
+		t.Fatalf("首次撤销后应恢复原学分来源\n免修前：%q\n撤销后：%q", lineBefore, line)
+	}
+
+	// 用不同原因再次撤销：幂等成功、返回原结果。
+	secondReason := "后来补充的另一个原因"
+	out, _, code := runCLI(t, file, "revoke-waiver", "s1", "w1", secondReason)
+	if code != 0 || !strings.Contains(out, "重复撤销不改变结果") {
+		t.Fatalf("重复撤销应幂等成功并说明不改变结果，code=%d out=%q", code, out)
+	}
+
+	// 首次撤销原因不能被覆盖，已恢复的学分来源不能改变。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：4") {
+		t.Fatalf("重复撤销后总学分应仍为 4，code=%d out=%q", code, out)
+	}
+	if line := checkLine(t, file, "s1", "要求 r1"); line != lineBefore {
+		t.Fatalf("重复撤销不应改变已恢复的学分来源\n免修前：%q\n重复撤销后：%q",
+			lineBefore, line)
+	}
+	out, _, code = runCLI(t, file, "show", "s1")
+	if code != 0 {
+		t.Fatalf("show 失败：%s", out)
+	}
+	if !strings.Contains(out, "状态：已撤销（"+firstReason+"）") {
+		t.Fatalf("应保留首次撤销原因 %q，out=%q", firstReason, out)
+	}
+	if strings.Contains(out, secondReason) {
+		t.Fatalf("后来给出的不同原因不能覆盖首次撤销原因，out=%q", out)
+	}
+
+	// 按原编号、原内容重新申请：返回已撤销的原申请，不会重新生效，
+	// 学分来源仍是最先提交通过的修读。
+	out, _, code = runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖")
+	if code != 0 || !strings.Contains(out, "状态：已撤销") ||
+		strings.Contains(out, "免修 w1 有效") {
+		t.Fatalf("重试已撤销申请应返回原已撤销结果，code=%d out=%q", code, out)
+	}
+	if line := checkLine(t, file, "s1", "要求 r1"); line != lineBefore {
+		t.Fatalf("重新申请不应改变已恢复的学分来源\n免修前：%q\n重新申请后：%q",
+			lineBefore, line)
+	}
+	out, _, _ = runCLI(t, file, "show", "s1")
+	if !strings.Contains(out, "状态：已撤销（"+firstReason+"）") ||
+		strings.Contains(out, secondReason) {
+		t.Fatalf("重新申请后首次撤销原因仍应保留、不同原因仍不应出现，out=%q", out)
+	}
+}
+
 // TestCLISubmitResultUnknownEnrollmentUnderOtherStudent 修读编号只存在于 s1 名下时，
 // 用 s2 的名义提交结果必须明确报告 s2 名下没有该修读、退出码 1，不能借用 s1 的
 // 修读，也不能为 s2 补出新记录；拒绝后两人的状态、要求与总学分与提交前一致，
