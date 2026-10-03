@@ -1,6 +1,9 @@
 package credit
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func mustStudent(t *testing.T, s *Store, id string) {
 	t.Helper()
@@ -506,6 +509,153 @@ func TestWaiverAndPassCountOnceWithWaiverSource(t *testing.T) {
 	}
 	if len(st.PassedEnrollmentIDs) != 1 || st.PassedEnrollmentIDs[0] != "e1" {
 		t.Fatalf("修读历史应同时保留，得到 %v", st.PassedEnrollmentIDs)
+	}
+}
+
+// 两名学生为同一门课程建立同号要求、在同学期使用相同修读编号时，
+// 结果提交与核对必须严格按学生归属区分，且与登记/处理顺序无关。
+// passer 的同号修读提交通过、failer 的提交未通过，两人结果互不影响。
+func checkSharedIDScenario(t *testing.T, s *Store, passer, failer string) {
+	t.Helper()
+
+	// 初始：两份修读都是选课，各自核对 0 学分且要求未满足。
+	for _, st := range []string{passer, failer} {
+		if e := s.Enrollment(st, "e1"); e == nil || e.Result != Enrolled {
+			t.Fatalf("%s 的修读 e1 初始应为选课，得到 %+v", st, e)
+		}
+		rep := s.CheckStudent(st)
+		if rep.TotalCredits != 0 || len(rep.Unmet) != 1 || rep.Unmet[0] != "r1" {
+			t.Fatalf("%s 初始核对应为 0 学分且 r1 未满足，得到学分=%d 未满足=%v",
+				st, rep.TotalCredits, rep.Unmet)
+		}
+	}
+
+	// passer 的 e1 提交通过。
+	if _, changed, err := s.SubmitResult(passer, "e1", Passed); err != nil || !changed {
+		t.Fatalf("%s 提交通过应成功，changed=%v err=%v", passer, changed, err)
+	}
+	// 只有 passer 获得 4 学分，要求满足且来源指向本人这份修读。
+	rep := s.CheckStudent(passer)
+	st := rep.Requirements[0]
+	if rep.TotalCredits != 4 || !st.Satisfied || st.Source != "enrollment" ||
+		st.PassedEnrollmentID != "e1" || len(rep.Unmet) != 0 {
+		t.Fatalf("%s 应获得 4 学分且来源为本人修读 e1，得到学分=%d 状态=%+v 未满足=%v",
+			passer, rep.TotalCredits, st, rep.Unmet)
+	}
+	// failer 不能因编号相同拿到学分或被改成通过：仍是选课、0 学分、未满足。
+	if e := s.Enrollment(failer, "e1"); e.Result != Enrolled {
+		t.Fatalf("%s 的修读不应受 %s 提交影响，仍为选课，得到 %s", failer, passer, e.Result)
+	}
+	rep = s.CheckStudent(failer)
+	if rep.TotalCredits != 0 || len(rep.Unmet) != 1 || rep.Unmet[0] != "r1" {
+		t.Fatalf("%s 应仍为 0 学分且 r1 未满足，得到学分=%d 未满足=%v",
+			failer, rep.TotalCredits, rep.Unmet)
+	}
+
+	// failer 的同号修读提交未通过：与 passer 的通过是两次不同修读的结果，
+	// 应分别被接受，不能误判为同一次修读的结果冲突。
+	if _, changed, err := s.SubmitResult(failer, "e1", Failed); err != nil || !changed {
+		t.Fatalf("%s 提交未通过应成功，changed=%v err=%v", failer, changed, err)
+	}
+	// failer 仍为 0 学分、要求未满足。
+	rep = s.CheckStudent(failer)
+	if rep.TotalCredits != 0 || len(rep.Unmet) != 1 || rep.Unmet[0] != "r1" {
+		t.Fatalf("%s 未通过后应仍为 0 学分且未满足，得到学分=%d 未满足=%v",
+			failer, rep.TotalCredits, rep.Unmet)
+	}
+	// passer 原来的通过结果、学分与来源均保持不变。
+	if e := s.Enrollment(passer, "e1"); e.Result != Passed {
+		t.Fatalf("%s 的通过结果不应被 %s 的提交改动，得到 %s", passer, failer, e.Result)
+	}
+	rep = s.CheckStudent(passer)
+	st = rep.Requirements[0]
+	if rep.TotalCredits != 4 || !st.Satisfied || st.Source != "enrollment" ||
+		st.PassedEnrollmentID != "e1" {
+		t.Fatalf("%s 的通过结果与学分应保持不变，得到学分=%d 状态=%+v",
+			passer, rep.TotalCredits, st)
+	}
+
+	// 各自已提交结果后改提另一结果：按规则拒绝并保留原结果，互不影响。
+	if _, _, err := s.SubmitResult(passer, "e1", Failed); err == nil {
+		t.Fatalf("%s 已通过后改提未通过应被拒绝", passer)
+	}
+	if _, _, err := s.SubmitResult(failer, "e1", Passed); err == nil {
+		t.Fatalf("%s 已未通过后改提通过应被拒绝", failer)
+	}
+	if e := s.Enrollment(passer, "e1"); e.Result != Passed {
+		t.Fatalf("拒绝后 %s 的原结果应保留为通过，得到 %s", passer, e.Result)
+	}
+	if e := s.Enrollment(failer, "e1"); e.Result != Failed {
+		t.Fatalf("拒绝后 %s 的原结果应保留为未通过，得到 %s", failer, e.Result)
+	}
+	if rep := s.CheckStudent(passer); rep.TotalCredits != 4 {
+		t.Fatalf("拒绝后 %s 的学分应保持 4，得到 %d", passer, rep.TotalCredits)
+	}
+	if rep := s.CheckStudent(failer); rep.TotalCredits != 0 {
+		t.Fatalf("拒绝后 %s 的学分应保持 0，得到 %d", failer, rep.TotalCredits)
+	}
+}
+
+func TestResultSubmissionCrossStudentSharedIDs(t *testing.T) {
+	// 结果归属不能依赖先登记或先处理哪名学生：两种顺序各跑一遍。
+	t.Run("s1先登记先提交", func(t *testing.T) {
+		s := NewStore()
+		mustStudent(t, s, "s1")
+		mustStudent(t, s, "s2")
+		mustCourse(t, s, "c1", "数学", 4)
+		mustReq(t, s, "s1", "r1", "c1")
+		mustReq(t, s, "s2", "r1", "c1")
+		mustEnroll(t, s, "s1", "r1", "2024春", "e1")
+		mustEnroll(t, s, "s2", "r1", "2024春", "e1")
+		checkSharedIDScenario(t, s, "s1", "s2")
+	})
+	t.Run("s2先登记先提交", func(t *testing.T) {
+		s := NewStore()
+		mustStudent(t, s, "s2")
+		mustStudent(t, s, "s1")
+		mustCourse(t, s, "c1", "数学", 4)
+		mustReq(t, s, "s2", "r1", "c1")
+		mustReq(t, s, "s1", "r1", "c1")
+		mustEnroll(t, s, "s2", "r1", "2024春", "e1")
+		mustEnroll(t, s, "s1", "r1", "2024春", "e1")
+		checkSharedIDScenario(t, s, "s2", "s1")
+	})
+}
+
+func TestSubmitResultNotBorrowedAcrossStudents(t *testing.T) {
+	s := NewStore()
+	mustStudent(t, s, "s1")
+	mustStudent(t, s, "s2")
+	mustCourse(t, s, "c1", "数学", 4)
+	mustReq(t, s, "s1", "r1", "c1")
+	mustEnroll(t, s, "s1", "r1", "2024春", "e1")
+
+	// 修读编号 e1 只存在于 s1 名下：用 s2 的编号提交结果必须拒绝，
+	// 并明确指出 s2 名下没有该修读。
+	_, _, err := s.SubmitResult("s2", "e1", Passed)
+	if err == nil {
+		t.Fatal("s2 名下没有修读 e1，提交结果应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "s2") || !strings.Contains(err.Error(), "e1") {
+		t.Fatalf("错误应明确指出 s2 名下不存在修读 e1，得到 %v", err)
+	}
+
+	// 不能借用 s1 的修读，也不能为 s2 补出一条新记录。
+	if s.Enrollment("s2", "e1") != nil || len(s.Enrollments("s2")) != 0 {
+		t.Fatalf("拒绝后不应为 s2 新增修读记录，得到 %v", s.Enrollments("s2"))
+	}
+	if e := s.Enrollment("s1", "e1"); e.Result != Enrolled {
+		t.Fatalf("s1 的修读不应被改动，仍为选课，得到 %s", e.Result)
+	}
+	// 两人的修读状态、要求满足情况和总学分都与提交前一致。
+	rep1 := s.CheckStudent("s1")
+	if rep1.TotalCredits != 0 || len(rep1.Unmet) != 1 || rep1.Unmet[0] != "r1" {
+		t.Fatalf("s1 的核对应与提交前一致，得到学分=%d 未满足=%v",
+			rep1.TotalCredits, rep1.Unmet)
+	}
+	rep2 := s.CheckStudent("s2")
+	if rep2.TotalCredits != 0 || len(rep2.Unmet) != 0 || len(rep2.Requirements) != 0 {
+		t.Fatalf("s2 的核对应与提交前一致（无任何记录），得到 %+v", rep2)
 	}
 }
 

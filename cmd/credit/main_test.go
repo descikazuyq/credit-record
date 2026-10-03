@@ -341,3 +341,156 @@ func TestCLIIdempotentCommandsDoNotGrow(t *testing.T) {
 		t.Fatalf("幂等命令不应改变记录文件\nfirst=%s\nsecond=%s", first, second)
 	}
 }
+
+// 两名学生共享要求编号与修读编号时，提交结果必须严格按学生归属：
+// 一人通过不影响另一人，一人未通过也不与另一人的通过冲突。
+func TestCLICrossStudentSharedEnrollmentIDs(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+
+	// 两名学生为同一门 4 学分课程建立同号要求，同学期使用相同修读编号。
+	steps := [][]string{
+		{"student", "s1"},
+		{"student", "s2"},
+		{"course", "c1", "数学", "4"},
+		{"req", "s1", "r1", "c1"},
+		{"req", "s2", "r1", "c1"},
+		{"enroll", "s1", "r1", "2024春", "e1"},
+		{"enroll", "s2", "r1", "2024春", "e1"},
+	}
+	for _, st := range steps {
+		if _, _, code := runCLI(t, file, st...); code != 0 {
+			t.Fatalf("步骤 %v 应成功（退出码 0）", st)
+		}
+	}
+
+	// 初始：两人各自核对均为 0 学分、要求未满足，修读状态都是选课。
+	for _, st := range []string{"s1", "s2"} {
+		out, _, code := runCLI(t, file, "check", st)
+		if code != 0 || !strings.Contains(out, "总学分：0") ||
+			!strings.Contains(out, "未满足要求：[r1]") {
+			t.Fatalf("%s 初始核对应为 0 学分且 r1 未满足，code=%d out=%q", st, code, out)
+		}
+		out, _, code = runCLI(t, file, "show", st)
+		if code != 0 || !strings.Contains(out, "修读 e1：要求 r1，学期 2024春，结果：选课") {
+			t.Fatalf("%s 的修读 e1 初始应为选课，code=%d out=%q", st, code, out)
+		}
+	}
+
+	// s1 的 e1 提交通过，退出码 0。
+	if _, _, code := runCLI(t, file, "pass", "s1", "e1"); code != 0 {
+		t.Fatal("首次提交通过应返回退出码 0")
+	}
+	// 只有 s1 获得 4 学分，要求满足且来源指向本人这份修读。
+	out, _, code := runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：4") ||
+		!strings.Contains(out, "来源为通过修读 e1") ||
+		!strings.Contains(out, "未满足要求：（无）") {
+		t.Fatalf("s1 应获得 4 学分且来源为本人修读 e1，code=%d out=%q", code, out)
+	}
+	// s2 不能因编号相同拿到学分或被改成通过：仍是选课、0 学分、未满足。
+	out, _, code = runCLI(t, file, "check", "s2")
+	if code != 0 || !strings.Contains(out, "总学分：0") ||
+		!strings.Contains(out, "未满足要求：[r1]") {
+		t.Fatalf("s2 应仍为 0 学分且未满足，code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, file, "show", "s2")
+	if code != 0 || !strings.Contains(out, "结果：选课") {
+		t.Fatalf("s2 的修读不应被 s1 的提交改动，code=%d out=%q", code, out)
+	}
+
+	// s2 的同号修读提交未通过：与 s1 的通过是两次不同修读的结果，
+	// 应分别被接受（退出码 0），不能误判为同一次修读的结果冲突。
+	if _, _, code := runCLI(t, file, "fail", "s2", "e1"); code != 0 {
+		t.Fatal("s2 的同号修读提交未通过应被接受（退出码 0）")
+	}
+	// s2 仍为 0 学分、要求未满足。
+	out, _, code = runCLI(t, file, "check", "s2")
+	if code != 0 || !strings.Contains(out, "总学分：0") ||
+		!strings.Contains(out, "未满足要求：[r1]") {
+		t.Fatalf("s2 未通过后应仍为 0 学分且未满足，code=%d out=%q", code, out)
+	}
+	// s1 原来的通过结果、学分与来源均保持不变。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：4") ||
+		!strings.Contains(out, "来源为通过修读 e1") {
+		t.Fatalf("s1 的通过结果与学分应保持不变，code=%d out=%q", code, out)
+	}
+	// 两人的原始修读状态可明确区分：一个通过、一个未通过。
+	out, _, _ = runCLI(t, file, "show", "s1")
+	if !strings.Contains(out, "修读 e1：要求 r1，学期 2024春，结果：通过") {
+		t.Fatalf("s1 的修读应保持通过，out=%q", out)
+	}
+	out, _, _ = runCLI(t, file, "show", "s2")
+	if !strings.Contains(out, "修读 e1：要求 r1，学期 2024春，结果：未通过") {
+		t.Fatalf("s2 的修读应为未通过，out=%q", out)
+	}
+
+	// 各自已提交结果后改提另一结果：拒绝（退出码 1），双方原记录保留。
+	if _, _, code := runCLI(t, file, "fail", "s1", "e1"); code != 1 {
+		t.Fatal("s1 已通过后改提未通过应被拒绝（退出码 1）")
+	}
+	if _, _, code := runCLI(t, file, "pass", "s2", "e1"); code != 1 {
+		t.Fatal("s2 已未通过后改提通过应被拒绝（退出码 1）")
+	}
+	out, _, _ = runCLI(t, file, "show", "s1")
+	if !strings.Contains(out, "结果：通过") {
+		t.Fatalf("拒绝后 s1 的原结果应保留为通过，out=%q", out)
+	}
+	out, _, _ = runCLI(t, file, "show", "s2")
+	if !strings.Contains(out, "结果：未通过") {
+		t.Fatalf("拒绝后 s2 的原结果应保留为未通过，out=%q", out)
+	}
+	out, _, _ = runCLI(t, file, "check", "s1")
+	if !strings.Contains(out, "总学分：4") {
+		t.Fatalf("拒绝后 s1 的学分应保持 4，out=%q", out)
+	}
+	out, _, _ = runCLI(t, file, "check", "s2")
+	if !strings.Contains(out, "总学分：0") {
+		t.Fatalf("拒绝后 s2 的学分应保持 0，out=%q", out)
+	}
+}
+
+// 修读编号只存在于第一名学生名下时，用第二名学生的编号提交结果必须
+// 明确拒绝：不借用他人修读，也不为第二名学生补出新记录。
+func TestCLISubmitResultNotBorrowedAcrossStudents(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	steps := [][]string{
+		{"student", "s1"},
+		{"student", "s2"},
+		{"course", "c1", "数学", "4"},
+		{"req", "s1", "r1", "c1"},
+		{"enroll", "s1", "r1", "2024春", "e1"},
+	}
+	for _, st := range steps {
+		if _, _, code := runCLI(t, file, st...); code != 0 {
+			t.Fatalf("步骤 %v 失败", st)
+		}
+	}
+
+	// e1 只在 s1 名下：用 s2 提交结果应明确报告 s2 名下没有该修读，退出码 1。
+	_, errText, code := runCLI(t, file, "pass", "s2", "e1")
+	if code != 1 || !strings.Contains(errText, "学生 s2 名下不存在修读 e1") {
+		t.Fatalf("应明确报告 s2 名下没有该修读且退出码 1，code=%d err=%q", code, errText)
+	}
+
+	// 不为 s2 补出一条新记录。
+	out, _, code := runCLI(t, file, "show", "s2")
+	if code != 0 || !strings.Contains(out, "修读：（无）") {
+		t.Fatalf("拒绝后 s2 名下不应出现修读记录，code=%d out=%q", code, out)
+	}
+	// 也不借用 s1 的修读：s1 的 e1 仍是选课。
+	out, _, code = runCLI(t, file, "show", "s1")
+	if code != 0 || !strings.Contains(out, "修读 e1：要求 r1，学期 2024春，结果：选课") {
+		t.Fatalf("s1 的修读不应被改动，code=%d out=%q", code, out)
+	}
+	// 两人的要求满足情况和总学分都与提交前一致。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：0") ||
+		!strings.Contains(out, "未满足要求：[r1]") {
+		t.Fatalf("s1 的核对应与提交前一致，code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, file, "check", "s2")
+	if code != 0 || !strings.Contains(out, "总学分：0") {
+		t.Fatalf("s2 的核对应与提交前一致，code=%d out=%q", code, out)
+	}
+}
