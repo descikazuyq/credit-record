@@ -988,6 +988,294 @@ func TestRevokeWaiverWithoutPassReturnsToUnmet(t *testing.T) {
 	}
 }
 
+// setupSharedWaiverReqs 建立两名学生各有一项同编号要求 r1 的情形：
+// s1 的 r1 指向 4 学分课程 c1，s2 的 r1 指向 3 学分课程 c2；两人都没有
+// 任何修读。registerFirst 控制先登记哪名学生，用于证明结论不依赖登记次序。
+func setupSharedWaiverReqs(t *testing.T, s *Store, registerFirst string) {
+	t.Helper()
+	second := "s2"
+	if registerFirst == "s2" {
+		second = "s1"
+	}
+	mustStudent(t, s, registerFirst)
+	mustStudent(t, s, second)
+	mustCourse(t, s, "c1", "高等数学", 4)
+	mustCourse(t, s, "c2", "大学物理", 3)
+	mustReq(t, s, "s1", "r1", "c1")
+	mustReq(t, s, "s2", "r1", "c2")
+
+	// 同编号要求只在所属学生名下唯一：两条记录互相独立、指向不同课程。
+	r1 := s.Requirement("s1", "r1")
+	r2 := s.Requirement("s2", "r1")
+	if r1 == nil || r2 == nil || r1 == r2 || r1.CourseID != "c1" || r2.CourseID != "c2" {
+		t.Fatalf("两名学生应各有一条独立的 r1，分别指向 c1/c2，得到 %+v %+v", r1, r2)
+	}
+	// 初始两人都没有修读、0 学分、要求未满足。
+	assertUnmetZero(t, s, "s1")
+	assertUnmetZero(t, s, "s2")
+}
+
+// sharedWaiverExpect 描述一名学生在同号免修情形中的预期归属。
+type sharedWaiverExpect struct {
+	course string
+	credit int
+	basis  string
+}
+
+func sharedWaiverExpectFor(student string) sharedWaiverExpect {
+	if student == "s1" {
+		return sharedWaiverExpect{course: "c1", credit: 4, basis: "学科竞赛获奖"}
+	}
+	return sharedWaiverExpect{course: "c2", credit: 3, basis: "外校同层次课程"}
+}
+
+// assertWaiverOwner 核对该学生的 r1 已由本人名下的有效免修 w1 满足：
+// 学分为本人课程学分、来源指向本人的 w1、依据为本人依据，且免修历史中
+// 只出现属于本人的记录。
+func assertWaiverOwner(t *testing.T, s *Store, student string, historyLen int) {
+	t.Helper()
+	want := sharedWaiverExpectFor(student)
+	w := s.Waiver(student, "w1")
+	if w == nil || w.StudentID != student || w.ReqID != "r1" ||
+		w.Status != WaiverApproved || w.Basis != want.basis {
+		t.Fatalf("学生 %s 名下应有本人的有效免修 w1（依据 %q），得到 %+v",
+			student, want.basis, w)
+	}
+	rep := s.CheckStudent(student)
+	if rep.TotalCredits != want.credit || len(rep.Unmet) != 0 {
+		t.Fatalf("学生 %s 应凭本人 w1 获得 %d 学分且无未满足，得到学分=%d 未满足=%v",
+			student, want.credit, rep.TotalCredits, rep.Unmet)
+	}
+	if len(rep.Requirements) != 1 {
+		t.Fatalf("学生 %s 应只有一项要求，得到 %+v", student, rep.Requirements)
+	}
+	st := rep.Requirements[0]
+	if !st.Satisfied || st.Source != "waiver" || st.WaiverID != "w1" {
+		t.Fatalf("学生 %s 的要求应由本人有效免修 w1 满足，得到 %+v", student, st)
+	}
+	if st.Course == nil || st.Course.ID != want.course || st.Course.Credit != want.credit {
+		t.Fatalf("学生 %s 的来源课程应为 %s（%d 学分），得到 %+v",
+			student, want.course, want.credit, st.Course)
+	}
+	ws := s.Waivers(student)
+	if len(ws) != historyLen {
+		t.Fatalf("学生 %s 的免修历史应有 %d 条，得到 %d 条 %+v",
+			student, historyLen, len(ws), ws)
+	}
+	for _, h := range ws {
+		if h.StudentID != student {
+			t.Fatalf("学生 %s 的免修历史中混入他人的申请 %+v", student, h)
+		}
+	}
+}
+
+// assertNoRejectedOrRevoked 核对该学生没有任何被拒绝或已撤销的免修记录。
+func assertNoRejectedOrRevoked(t *testing.T, s *Store, student string) {
+	t.Helper()
+	rep := s.CheckStudent(student)
+	if len(rep.RejectedWaivers) != 0 || len(rep.RevokedWaivers) != 0 {
+		t.Fatalf("学生 %s 不应有被拒绝或已撤销免修，得到 %+v %v",
+			student, rep.RejectedWaivers, rep.RevokedWaivers)
+	}
+}
+
+// assertNoWaiverHistory 核对该学生没有任何免修记录（他人的同号申请不可见）。
+func assertNoWaiverHistory(t *testing.T, s *Store, student string) {
+	t.Helper()
+	if ws := s.Waivers(student); len(ws) != 0 {
+		t.Fatalf("学生 %s 不应看到任何免修记录，得到 %+v", student, ws)
+	}
+	if w := s.Waiver(student, "w1"); w != nil {
+		t.Fatalf("学生 %s 名下不应出现他人的 w1，得到 %+v", student, w)
+	}
+	rep := s.CheckStudent(student)
+	if len(rep.RejectedWaivers) != 0 || len(rep.RevokedWaivers) != 0 {
+		t.Fatalf("学生 %s 的核对结果不应出现他人的免修，得到 %+v %v",
+			student, rep.RejectedWaivers, rep.RevokedWaivers)
+	}
+}
+
+// TestSharedWaiverIDsOwnership 两名学生的要求与免修编号都相同（r1/w1）时，
+// 编号只在所属学生名下唯一：先提交的一份只满足本人要求，另一人随后提交的
+// 同号申请正常生效，不被当作重复提交、编号冲突或要求已免修；两人的学分、
+// 来源与历史始终各归各。两种提交次序结论一致。
+func TestSharedWaiverIDsOwnership(t *testing.T) {
+	for _, first := range []string{"s1", "s2"} {
+		second := "s2"
+		if first == "s2" {
+			second = "s1"
+		}
+		t.Run(first+"先提交", func(t *testing.T) {
+			s := NewStore()
+			setupSharedWaiverReqs(t, s, first)
+			firstWant := sharedWaiverExpectFor(first)
+			secondWant := sharedWaiverExpectFor(second)
+
+			// 先提交者：正常生效，只能使本人的要求满足。
+			w, a, err := s.ApplyWaiver(first, "r1", "w1", firstWant.basis)
+			if err != nil || a != ActionCreated || w.Status != WaiverApproved {
+				t.Fatalf("%s 首次申请应正常生效，得到 %+v action=%v err=%v",
+					first, w, a, err)
+			}
+			assertWaiverOwner(t, s, first, 1)
+			assertNoRejectedOrRevoked(t, s, first)
+
+			// 另一人：要求仍未满足、学分为零，免修历史里看不到前一人的申请。
+			assertUnmetZero(t, s, second)
+			assertNoWaiverHistory(t, s, second)
+
+			// 另一人随后用同编号 w1 提交自己的申请：必须新建并生效，
+			// 不能被判为重复提交、编号冲突或该要求已有有效免修。
+			w2, a, err := s.ApplyWaiver(second, "r1", "w1", secondWant.basis)
+			if err != nil || a != ActionCreated || w2.Status != WaiverApproved {
+				t.Fatalf("%s 的同号申请应独立生效，得到 %+v action=%v err=%v",
+					second, w2, a, err)
+			}
+			if w2 == w {
+				t.Fatal("两名学生的同号免修必须是两条独立记录，不能返回同一条")
+			}
+
+			// 两人分别拿到本人课程的学分，来源都是本人名下的 w1，
+			// 要求与免修编号相同也能凭学生记录分清课程与依据。
+			assertWaiverOwner(t, s, "s1", 1)
+			assertWaiverOwner(t, s, "s2", 1)
+			assertNoRejectedOrRevoked(t, s, "s1")
+			assertNoRejectedOrRevoked(t, s, "s2")
+			if s.Waiver("s1", "w1").Basis == s.Waiver("s2", "w1").Basis {
+				t.Fatal("两人的依据可以不同，应各自保留在本人记录中")
+			}
+		})
+	}
+}
+
+// TestSameStudentWaiverRulesKeptAcrossSharedIDs 两名学生各自持有同号有效免修
+// 后，同一学生名下的既有限制仍然成立：原样重复返回原申请；同编号换依据按
+// 内容冲突拒绝且不动他人记录；用新编号再次取代已免修的 r1 被拒绝并留下
+// 独立的拒绝记录（核对中列出申请编号、目标要求、依据与已有有效免修的具体
+// 原因），原有效免修继续作为唯一学分来源，另一人全程不受影响。
+func TestSameStudentWaiverRulesKeptAcrossSharedIDs(t *testing.T) {
+	s := NewStore()
+	setupSharedWaiverReqs(t, s, "s1")
+	basisS1 := sharedWaiverExpectFor("s1").basis
+	basisS2 := sharedWaiverExpectFor("s2").basis
+	if _, _, err := s.ApplyWaiver("s1", "r1", "w1", basisS1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyWaiver("s2", "r1", "w1", basisS2); err != nil {
+		t.Fatal(err)
+	}
+
+	s2wBefore := s.Waiver("s2", "w1")
+
+	// 原编号、原要求、原依据再次提交：返回本人的原申请，历史与学分不增加。
+	got, a, err := s.ApplyWaiver("s1", "r1", "w1", basisS1)
+	if err != nil || a != ActionExisted || got != s.Waiver("s1", "w1") {
+		t.Fatalf("原样重复提交应返回本人原申请，得到 %+v action=%v err=%v", got, a, err)
+	}
+	assertWaiverOwner(t, s, "s1", 1)
+	assertWaiverOwner(t, s, "s2", 1)
+
+	// 在原 w1 下改换依据：按内容冲突拒绝，不新增申请，原依据与有效状态保留。
+	if _, _, err := s.ApplyWaiver("s1", "r1", "w1", "改换后的依据"); err == nil {
+		t.Fatal("同一学生在原免修编号下改换依据应被拒绝")
+	}
+	w1 := s.Waiver("s1", "w1")
+	if w1.Status != WaiverApproved || w1.Basis != basisS1 {
+		t.Fatalf("冲突拒绝后原申请应保留原依据与有效状态，得到 %+v", w1)
+	}
+	assertWaiverOwner(t, s, "s1", 1)
+	// 另一人的同号记录不能被改动。
+	s2wAfter := s.Waiver("s2", "w1")
+	if s2wAfter != s2wBefore || s2wAfter.Basis != basisS2 ||
+		s2wAfter.Status != WaiverApproved {
+		t.Fatalf("s1 的冲突请求不应改动 s2 的同号免修，得到 %+v", s2wAfter)
+	}
+	assertWaiverOwner(t, s, "s2", 1)
+
+	// 用新免修编号 w2 再次取代已经免修的 r1：拒绝，但在提交者历史中
+	// 留下一条独立的拒绝记录（编号、目标要求、依据都保留）。
+	w2, a, err := s.ApplyWaiver("s1", "r1", "w2", "再次申请的新依据")
+	if err != nil || a != ActionCreated || w2.Status != WaiverRejected {
+		t.Fatalf("新编号取代已免修要求应拒绝并新建拒绝记录，得到 %+v action=%v err=%v",
+			w2, a, err)
+	}
+	if w2.ReqID != "r1" || w2.Basis != "再次申请的新依据" ||
+		!strings.Contains(w2.Reason, "w1") {
+		t.Fatalf("拒绝记录应保留目标要求、依据，并指明已有有效免修 w1，得到 %+v", w2)
+	}
+	assertWaiverOwner(t, s, "s1", 2) // 历史现有 w1、w2 两条
+
+	// 核对结果：r1 仍由原 w1 满足、4 学分只计一次；拒绝清单必须对应到
+	// w2 这次申请并给出具体原因，不能只有一个没有对应申请的失败提示。
+	rep := s.CheckStudent("s1")
+	if rep.TotalCredits != 4 || len(rep.Unmet) != 0 {
+		t.Fatalf("原有效免修应继续作为学分来源，得到学分=%d 未满足=%v",
+			rep.TotalCredits, rep.Unmet)
+	}
+	st := rep.Requirements[0]
+	if !st.Satisfied || st.Source != "waiver" || st.WaiverID != "w1" {
+		t.Fatalf("r1 仍应由原有效免修 w1 满足，得到 %+v", st)
+	}
+	if len(rep.RejectedWaivers) != 1 {
+		t.Fatalf("核对应列出 1 条被拒绝免修，得到 %+v", rep.RejectedWaivers)
+	}
+	rj := rep.RejectedWaivers[0]
+	if rj.Waiver.ID != "w2" || rj.Waiver.ReqID != "r1" ||
+		rj.Waiver.Basis != "再次申请的新依据" || !strings.Contains(rj.Reason, "w1") {
+		t.Fatalf("核对应列出 w2 的编号、目标要求、依据及已有有效免修 w1 的原因，得到 %+v", rj)
+	}
+	out := rep.String()
+	if !strings.Contains(out, `免修 w2（要求 r1，依据 "再次申请的新依据"）`) ||
+		!strings.Contains(out, "该要求已有有效免修 w1") {
+		t.Fatalf("核对文本应对应到 w2 这次申请并说明具体原因，得到：\n%s", out)
+	}
+
+	// 被拒绝的 w2 原样重复提交：返回原拒绝记录，不新增、不重新生效。
+	got2, a, err := s.ApplyWaiver("s1", "r1", "w2", "再次申请的新依据")
+	if err != nil || a != ActionExisted || got2 != w2 || got2.Status != WaiverRejected {
+		t.Fatalf("重复提交被拒绝的 w2 应幂等返回原记录，得到 %+v action=%v err=%v",
+			got2, a, err)
+	}
+	assertWaiverOwner(t, s, "s1", 2)
+
+	// 另一人的免修历史、有效申请与核对结果全程保持原样。
+	if ws := s.Waivers("s2"); len(ws) != 1 || ws[0].ID != "w1" ||
+		ws[0].Basis != basisS2 {
+		t.Fatalf("s2 的历史应只有本人的 w1，得到 %+v", ws)
+	}
+	rep2 := s.CheckStudent("s2")
+	if rep2.TotalCredits != 3 || len(rep2.RejectedWaivers) != 0 {
+		t.Fatalf("s2 应仍为 3 学分且无拒绝记录，得到学分=%d 拒绝=%+v",
+			rep2.TotalCredits, rep2.RejectedWaivers)
+	}
+
+	// 保存后重新打开：两名学生的同号有效免修、s1 的独立拒绝记录与各自
+	// 学分来源仍可分清、可核对。
+	path := filepath.Join(t.TempDir(), "records.json")
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, existed, err := Load(path)
+	if err != nil || !existed {
+		t.Fatalf("Load: existed=%v err=%v", existed, err)
+	}
+	lw1 := loaded.Waiver("s1", "w1")
+	lw2 := loaded.Waiver("s2", "w1")
+	if lw1 == nil || lw2 == nil || lw1 == lw2 ||
+		lw1.Basis != basisS1 || lw2.Basis != basisS2 {
+		t.Fatalf("重新打开后两条同号免修应仍互相独立且依据各属本人，得到 %+v %+v", lw1, lw2)
+	}
+	assertWaiverOwner(t, loaded, "s1", 2)
+	assertWaiverOwner(t, loaded, "s2", 1)
+	lrep := loaded.CheckStudent("s1")
+	if len(lrep.RejectedWaivers) != 1 ||
+		lrep.RejectedWaivers[0].Waiver.ID != "w2" ||
+		!strings.Contains(lrep.RejectedWaivers[0].Reason, "w1") {
+		t.Fatalf("重新打开后 w2 的拒绝记录与具体原因应保留，得到 %+v",
+			lrep.RejectedWaivers)
+	}
+}
+
 // TestRevokeRevokedWaiverKeepsFirstReasonAndSource 同一份已撤销免修再次
 // 被撤销时返回原结果：后来给出的不同原因不能覆盖首次撤销原因，也不能
 // 改变已经恢复的学分来源。

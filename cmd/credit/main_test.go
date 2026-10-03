@@ -511,6 +511,201 @@ func TestCLISharedEnrollmentResultOwnershipReversed(t *testing.T) {
 	}
 }
 
+// setupCLISharedWaiverReqs 在记录文件中建立两名学生各一项同编号要求 r1：
+// s1 的 r1 指向 4 学分的 c1，s2 的 r1 指向 3 学分的 c2；两人均无修读。
+func setupCLISharedWaiverReqs(t *testing.T, file string) {
+	t.Helper()
+	for _, st := range [][]string{
+		{"student", "s1"},
+		{"student", "s2"},
+		{"course", "c1", "高等数学", "4"},
+		{"course", "c2", "大学物理", "3"},
+		{"req", "s1", "r1", "c1"},
+		{"req", "s2", "r1", "c2"},
+	} {
+		if _, errText, code := runCLI(t, file, st...); code != 0 {
+			t.Fatalf("步骤 %v 应成功，code=%d err=%q", st, code, errText)
+		}
+	}
+}
+
+// assertCLIWaiverOwner 跨进程核对该学生：要求 r1 已满足、学分为本人课程学分、
+// 来源是本人名下的有效免修 w1，且 show 中只呈现本人的依据。
+func assertCLIWaiverOwner(t *testing.T, file, student, course, courseName, credit, basis string) {
+	t.Helper()
+	out, _, code := runCLI(t, file, "check", student)
+	if code != 0 {
+		t.Fatalf("学生 %s 核对失败 code=%d out=%q", student, code, out)
+	}
+	want := []string{
+		"总学分：" + credit,
+		"要求 r1（课程 " + course + "《" + courseName + "》，" + credit + " 学分）：已满足，来源为有效免修 w1",
+	}
+	for _, frag := range want {
+		if !strings.Contains(out, frag) {
+			t.Fatalf("学生 %s 的核对结果应包含 %q，out=%q", student, frag, out)
+		}
+	}
+	if strings.Contains(out, "未满足要求：[") {
+		t.Fatalf("学生 %s 不应有未满足要求，out=%q", student, out)
+	}
+	show, _, code := runCLI(t, file, "show", student)
+	if code != 0 {
+		t.Fatalf("学生 %s show 失败 code=%d out=%q", student, code, show)
+	}
+	if !strings.Contains(show, "要求 r1 -> 课程 "+course) ||
+		!strings.Contains(show, `免修 w1：要求 r1，依据 "`+basis+`"，状态：有效`) {
+		t.Fatalf("学生 %s 的记录应分清本人的课程与依据，show=%q", student, show)
+	}
+}
+
+// TestCLISharedWaiverIDsOwnership 两名学生的要求与免修编号都相同（r1/w1），
+// 分别指向 4 学分与 3 学分课程。每次命令都是独立进程（重新加载记录文件），
+// 验证不论谁先提交，同号申请各归各、先后正常生效、学分来源分别为本人的 w1。
+func TestCLISharedWaiverIDsOwnership(t *testing.T) {
+	const basisS1 = "学科竞赛获奖"
+	const basisS2 = "外校同层次课程"
+	for _, first := range []string{"s1", "s2"} {
+		second := "s2"
+		if first == "s2" {
+			second = "s1"
+		}
+		t.Run(first+"先提交", func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "records.json")
+			setupCLISharedWaiverReqs(t, file)
+			basis := map[string]string{"s1": basisS1, "s2": basisS2}
+			course := map[string]string{"s1": "c1", "s2": "c2"}
+			courseName := map[string]string{"s1": "高等数学", "s2": "大学物理"}
+			credit := map[string]string{"s1": "4", "s2": "3"}
+
+			// 先提交者：申请有效，只能使本人的 r1 满足。
+			out, _, code := runCLI(t, file, "waiver", first, "r1", "w1", basis[first])
+			if code != 0 || !strings.Contains(out, "免修 w1 有效") {
+				t.Fatalf("%s 首次申请应有效且退出码 0，code=%d out=%q", first, code, out)
+			}
+			assertCLIWaiverOwner(t, file, first, course[first], courseName[first],
+				credit[first], basis[first])
+
+			// 另一人：要求仍未满足、0 学分，记录中看不到前一人的申请。
+			out, _, code = runCLI(t, file, "check", second)
+			if code != 0 || !strings.Contains(out, "总学分：0") ||
+				!strings.Contains(out, "未满足要求：[r1]") ||
+				strings.Contains(out, "有效免修") {
+				t.Fatalf("%s 不应因 %s 的同号免修获得学分，code=%d out=%q",
+					second, first, code, out)
+			}
+			if show, _, _ := runCLI(t, file, "show", second); strings.Contains(show, "免修 w1") {
+				t.Fatalf("%s 的免修历史中不应出现 %s 的申请，show=%q", second, first, show)
+			}
+
+			// 另一人随后用同编号 w1 提交本人的非空依据：正常生效，
+			// 不能被判为重复提交、编号冲突或要求已免修。
+			out, _, code = runCLI(t, file, "waiver", second, "r1", "w1", basis[second])
+			if code != 0 || !strings.Contains(out, "免修 w1 有效") {
+				t.Fatalf("%s 的同号申请应独立生效，code=%d out=%q", second, code, out)
+			}
+
+			// 两人核对结果分别为 4 学分和 3 学分，来源均为本人名下的 w1，
+			// show 中各自只保留本人依据；编号相同仍能分清课程与依据。
+			assertCLIWaiverOwner(t, file, "s1", "c1", "高等数学", "4", basisS1)
+			assertCLIWaiverOwner(t, file, "s2", "c2", "大学物理", "3", basisS2)
+			showS1, _, _ := runCLI(t, file, "show", "s1")
+			showS2, _, _ := runCLI(t, file, "show", "s2")
+			if strings.Contains(showS1, basisS2) || strings.Contains(showS2, basisS1) {
+				t.Fatalf("两人的依据应各留本人名下：\nshow s1=%q\nshow s2=%q", showS1, showS2)
+			}
+		})
+	}
+}
+
+// TestCLISameStudentWaiverRulesKeptAcrossSharedIDs 两名学生各持同号有效免修后，
+// 同一学生名下的既有限制通过独立进程逐一步骤仍成立：原样重复幂等；同编号
+// 换依据按内容冲突拒绝；新编号 w2 取代已免修的 r1 被拒绝并留下独立拒绝记录，
+// 核对文本必须对应到 w2 这次申请并说明已有有效免修 w1；另一人全程不变。
+func TestCLISameStudentWaiverRulesKeptAcrossSharedIDs(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	setupCLISharedWaiverReqs(t, file)
+	const basisS1 = "学科竞赛获奖"
+	const basisS2 = "外校同层次课程"
+
+	if _, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", basisS1); code != 0 {
+		t.Fatal("s1 首次免修应成功")
+	}
+	if _, _, code := runCLI(t, file, "waiver", "s2", "r1", "w1", basisS2); code != 0 {
+		t.Fatal("s2 的同号免修应独立成功")
+	}
+
+	// 原编号、原要求、原依据再次提交：返回本人原申请（退出码 0），
+	// 历史条数与学分不增加。
+	out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", basisS1)
+	if code != 0 || !strings.Contains(out, "已提交过且内容一致，返回原申请，状态：有效") {
+		t.Fatalf("原样重复提交应幂等返回原有效申请，code=%d out=%q", code, out)
+	}
+	assertCLIWaiverOwner(t, file, "s1", "c1", "高等数学", "4", basisS1)
+	assertCLIWaiverOwner(t, file, "s2", "c2", "大学物理", "3", basisS2)
+
+	// 在原 w1 下改换依据：按内容冲突拒绝（退出码 1），不新增申请。
+	if _, errText, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "改换后的依据"); code != 1 {
+		t.Fatalf("同编号换依据应拒绝且退出码 1，code=%d err=%q", code, errText)
+	}
+	// 原依据与有效状态保留，学分仍是 4。
+	assertCLIWaiverOwner(t, file, "s1", "c1", "高等数学", "4", basisS1)
+	// 另一人的同号记录不能被改动。
+	assertCLIWaiverOwner(t, file, "s2", "c2", "大学物理", "3", basisS2)
+
+	// 用新免修编号 w2 再次取代已免修的 r1：拒绝（退出码 1），但在提交者
+	// 历史中留下独立的拒绝记录。
+	out, _, code = runCLI(t, file, "waiver", "s1", "r1", "w2", "再次申请的新依据")
+	if code != 1 || !strings.Contains(out, "免修申请 w2 已拒绝") {
+		t.Fatalf("新编号取代已免修要求应拒绝并记入历史，code=%d out=%q", code, out)
+	}
+
+	// 核对结果：r1 仍由原 w1 满足、4 学分只计一次；拒绝清单对应到 w2 这次
+	// 申请（编号、目标要求、依据），并说明该要求已有有效免修 w1 的具体原因。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：4") ||
+		!strings.Contains(out, "来源为有效免修 w1") {
+		t.Fatalf("原有效免修应继续作为唯一学分来源，code=%d out=%q", code, out)
+	}
+	for _, frag := range []string{
+		"被拒绝的免修：",
+		`免修 w2（要求 r1，依据 "再次申请的新依据"）`,
+		"该要求已有有效免修 w1",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Fatalf("核对结果应包含 %q，out=%q", frag, out)
+		}
+	}
+	// show 同样保留两条历史：w1 有效、w2 已拒绝且带具体原因。
+	show, _, code := runCLI(t, file, "show", "s1")
+	if code != 0 ||
+		!strings.Contains(show, `免修 w1：要求 r1，依据 "`+basisS1+`"，状态：有效`) ||
+		!strings.Contains(show, `免修 w2：要求 r1，依据 "再次申请的新依据"，状态：已拒绝`) ||
+		!strings.Contains(show, "该要求已有有效免修 w1") {
+		t.Fatalf("s1 历史应保留有效的 w1 与独立拒绝的 w2，code=%d show=%q", code, show)
+	}
+
+	// 被拒绝的 w2 原样重复提交：返回原拒绝记录（退出码 0），不新增不生效。
+	out, _, code = runCLI(t, file, "waiver", "s1", "r1", "w2", "再次申请的新依据")
+	if code != 0 || !strings.Contains(out, "已提交过且内容一致，返回原申请，状态：已拒绝") {
+		t.Fatalf("重复提交被拒绝的 w2 应幂等返回原记录，code=%d out=%q", code, out)
+	}
+
+	// 另一人的免修历史、有效申请与核对结果保持原样：只有本人的 w1，
+	// 看不到 s1 的 w2，仍是 3 学分。
+	out, _, code = runCLI(t, file, "check", "s2")
+	if code != 0 || !strings.Contains(out, "总学分：3") ||
+		!strings.Contains(out, "来源为有效免修 w1") ||
+		strings.Contains(out, "被拒绝的免修") || strings.Contains(out, "w2") {
+		t.Fatalf("s2 应保持 3 学分且无 s1 的拒绝记录，code=%d out=%q", code, out)
+	}
+	show, _, _ = runCLI(t, file, "show", "s2")
+	if !strings.Contains(show, `免修 w1：要求 r1，依据 "`+basisS2+`"，状态：有效`) ||
+		strings.Contains(show, "w2") || strings.Contains(show, basisS1) {
+		t.Fatalf("s2 的历史应只有本人的 w1，show=%q", show)
+	}
+}
+
 // TestCLISubmitResultUnknownEnrollmentUnderOtherStudent 修读编号只存在于 s1 名下时，
 // 用 s2 的名义提交结果必须明确报告 s2 名下没有该修读、退出码 1，不能借用 s1 的
 // 修读，也不能为 s2 补出新记录；拒绝后两人的状态、要求与总学分与提交前一致，
