@@ -168,6 +168,116 @@ func TestCLIRejectedWaiverHistoryPersists(t *testing.T) {
 	}
 }
 
+// TestCLIRejectedWaiverResubmitAfterRequirementBuilt 命令行回归：免修申请先因
+// 目标要求不存在被拒绝（退出码 1）；后来补建同编号要求，按原免修编号/原要求/
+// 原依据再次提交时沿用重复提交的退出码 0，但显示状态仍为已拒绝——不是获批，
+// 不新增申请，核对与历史继续展示同一条记录及具体原因。
+func TestCLIRejectedWaiverResubmitAfterRequirementBuilt(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "records.json")
+	runCLI(t, file, "student", "s1")
+	runCLI(t, file, "student", "s2")
+	runCLI(t, file, "course", "c1", "高等数学", "4")
+	runCLI(t, file, "course", "c2", "物理", "3")
+	// r1 先只在 s2 名下：对 s1 而言自己名下没有该要求。
+	if _, _, code := runCLI(t, file, "req", "s2", "r1", "c1"); code != 0 {
+		t.Fatal("为 s2 登记要求失败")
+	}
+
+	// 首次申请：s1 名下没有 r1，带非空依据，应拒绝（退出码 1）。
+	out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖")
+	if code != 1 {
+		t.Fatalf("目标要求不存在应退出码 1，得到 %d", code)
+	}
+	if !strings.Contains(out, "已拒绝") || !strings.Contains(out, "目标要求 r1 不存在") {
+		t.Fatalf("首次申请应显示已拒绝及具体原因，out=%q", out)
+	}
+
+	// 后来补建 s1 自己的同编号要求。
+	if _, _, code := runCLI(t, file, "req", "s1", "r1", "c1"); code != 0 {
+		t.Fatal("为 s1 补建要求失败")
+	}
+
+	// 目标已存在后按原编号、原要求、原依据再次提交：退出码 0（重复提交成功），
+	// 但状态仍为已拒绝，不能变成有效免修。
+	out, _, code = runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖")
+	if code != 0 {
+		t.Fatalf("相同内容重复提交应沿用退出码 0，得到 %d out=%q", code, out)
+	}
+	if !strings.Contains(out, "返回原申请") || !strings.Contains(out, "状态：已拒绝") {
+		t.Fatalf("重复提交应返回原申请且状态仍为已拒绝，out=%q", out)
+	}
+	if strings.Contains(out, "有效") {
+		t.Fatalf("重复提交不能被当成免修获批，out=%q", out)
+	}
+
+	// 纯幂等返回不应改动记录文件。
+	snapshot, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "学科竞赛获奖"); code != 0 {
+		t.Fatal("再次重复提交应继续退出码 0")
+	}
+	if after, err := os.ReadFile(file); err != nil || string(after) != string(snapshot) {
+		t.Fatal("幂等重复提交不应改动记录文件")
+	}
+
+	// 核对：要求未满足、总学分为零，旧申请不是学分来源；
+	// 被拒绝记录继续展示同一免修编号、目标要求、依据和具体原因。
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 {
+		t.Fatalf("核对应成功，code=%d out=%q", code, out)
+	}
+	if !strings.Contains(out, "总学分：0") {
+		t.Fatalf("旧拒绝申请不能成为学分来源，out=%q", out)
+	}
+	if !strings.Contains(out, "要求 r1") || !strings.Contains(out, "未满足") {
+		t.Fatalf("r1 无通过无有效免修时应列为未满足，out=%q", out)
+	}
+	if strings.Contains(out, "来源为有效免修") || strings.Contains(out, "获得课程学分") {
+		t.Fatalf("核对不应把旧申请列为有效免修来源，out=%q", out)
+	}
+	if !strings.Contains(out, "免修 w1（要求 r1，依据 \"学科竞赛获奖\"）") ||
+		!strings.Contains(out, "目标要求 r1 不存在或不属于该学生") {
+		t.Fatalf("核对中的拒绝记录应展示同一编号/要求/依据/原因，out=%q", out)
+	}
+
+	// 历史查询（show）同样保留。
+	out, _, code = runCLI(t, file, "show", "s1")
+	if code != 0 || !strings.Contains(out, "免修 w1：要求 r1，依据 \"学科竞赛获奖\"，状态：已拒绝") ||
+		!strings.Contains(out, "目标要求 r1 不存在") {
+		t.Fatalf("show 应继续展示同一条已拒绝记录及原因，code=%d out=%q", code, out)
+	}
+
+	// 同编号换另一项要求或另一份依据：内容冲突，明确拒绝，原结果保留。
+	if _, _, code := runCLI(t, file, "req", "s1", "r2", "c2"); code != 0 {
+		t.Fatal("登记 r2 失败")
+	}
+	if _, errText, code := runCLI(t, file, "waiver", "s1", "r2", "w1", "学科竞赛获奖"); code != 1 {
+		t.Fatalf("同编号换要求应按冲突拒绝（退出码 1），code=%d err=%q", code, errText)
+	}
+	if _, errText, code := runCLI(t, file, "waiver", "s1", "r1", "w1", "另一份依据"); code != 1 {
+		t.Fatalf("同编号换依据应按冲突拒绝（退出码 1），code=%d err=%q", code, errText)
+	}
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：0") ||
+		!strings.Contains(out, "免修 w1（要求 r1，依据 \"学科竞赛获奖\"）：目标要求 r1 不存在") {
+		t.Fatalf("冲突提交后原申请与原核对结果应保留，code=%d out=%q", code, out)
+	}
+
+	// 目标补建后用新编号正常申请新免修的既有行为不应受影响。
+	if out, _, code := runCLI(t, file, "waiver", "s1", "r1", "w2", "新免修依据"); code != 0 ||
+		!strings.Contains(out, "免修 w2 有效") {
+		t.Fatalf("补建后新编号申请应正常有效，code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, file, "check", "s1")
+	if code != 0 || !strings.Contains(out, "总学分：4") ||
+		!strings.Contains(out, "来源为有效免修 w2") ||
+		!strings.Contains(out, "免修 w1（要求 r1，依据 \"学科竞赛获奖\"）") {
+		t.Fatalf("新免修应带来学分，同时旧拒绝记录仍保留，code=%d out=%q", code, out)
+	}
+}
+
 func TestCLIUnknownStudent(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "records.json")
 	runCLI(t, file, "student", "s1")
