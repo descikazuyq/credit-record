@@ -160,11 +160,11 @@ func (s *Store) loadData(d *fileData) error {
 			return fmt.Errorf("学生 %s 的要求 %s 引用了不存在的课程 %s",
 				r.StudentID, r.ID, r.CourseID)
 		}
-		key := reqKey(r.StudentID, r.ID)
+		key := ownerKey{r.StudentID, r.ID}
 		if _, dup := s.reqByKey[key]; dup {
 			return fmt.Errorf("学生 %s 的要求编号 %s 重复", r.StudentID, r.ID)
 		}
-		dk := dupKey(r.StudentID, r.CourseID)
+		dk := ownerKey{r.StudentID, r.CourseID}
 		if other, dup := s.reqByDup[dk]; dup {
 			return fmt.Errorf("学生 %s 就课程 %s 存在重复要求 %s 与 %s",
 				r.StudentID, r.CourseID, other, r.ID)
@@ -186,7 +186,7 @@ func (s *Store) loadData(d *fileData) error {
 		if _, ok := s.studentByID[e.StudentID]; !ok {
 			return fmt.Errorf("修读 %s 引用了不存在的学生 %s", e.ID, e.StudentID)
 		}
-		r := s.reqByKey[reqKey(e.StudentID, e.ReqID)]
+		r := s.reqByKey[ownerKey{e.StudentID, e.ReqID}]
 		if r == nil {
 			return fmt.Errorf("学生 %s 的修读 %s 引用了不存在的要求 %s",
 				e.StudentID, e.ID, e.ReqID)
@@ -212,7 +212,7 @@ func (s *Store) loadData(d *fileData) error {
 			}
 			usedSeq[e.ResultSeq] = true
 		}
-		key := reqKey(e.StudentID, e.ID)
+		key := ownerKey{e.StudentID, e.ID}
 		if _, dup := s.enrByKey[key]; dup {
 			return fmt.Errorf("学生 %s 的修读编号 %s 重复", e.StudentID, e.ID)
 		}
@@ -222,7 +222,7 @@ func (s *Store) loadData(d *fileData) error {
 
 	// 免修（被拒绝的申请允许指向当时不存在的要求、依据也可以为空；
 	// 已撤销的申请则必须保留一份曾经有效的申请所必需的信息）
-	approvedReq := map[string]string{} // student+"\x00"+req -> waiverID
+	approvedReq := map[ownerKey]string{} // (学生, 要求) -> 有效免修编号
 	for _, w := range d.Waivers {
 		if w == nil {
 			return errors.New("存在空的免修记录")
@@ -243,9 +243,11 @@ func (s *Store) loadData(d *fileData) error {
 			if w.Basis == "" {
 				return fmt.Errorf("有效免修 %s 缺少依据", w.ID)
 			}
-			rk := reqKey(w.StudentID, w.ReqID)
+			rk := ownerKey{w.StudentID, w.ReqID}
 			if s.reqByKey[rk] == nil {
-				return fmt.Errorf("有效免修 %s 指向不存在的要求 %s", w.ID, w.ReqID)
+				return fmt.Errorf(
+					"有效免修 %s 的目标要求 %s 不属于该学生或不存在（不能借用其他学生名下的同号要求）",
+					w.ID, w.ReqID)
 			}
 			if other, dup := approvedReq[rk]; dup {
 				return fmt.Errorf("学生 %s 的要求 %s 同时存在有效免修 %s 与 %s",
@@ -259,7 +261,7 @@ func (s *Store) loadData(d *fileData) error {
 			// 原依据必须含有非空白内容。检查只读不写，依据中有实际
 			// 文字时原有空白一律保留，绝不为了通过检查改写保存下来
 			// 的材料内容。失效历史不参与有效免修的唯一性限制。
-			if s.reqByKey[reqKey(w.StudentID, w.ReqID)] == nil {
+			if s.reqByKey[ownerKey{w.StudentID, w.ReqID}] == nil {
 				return fmt.Errorf("学生 %s 的已撤销免修 %s 目标要求无效（要求 %s 不存在于该学生名下）",
 					w.StudentID, w.ID, w.ReqID)
 			}
@@ -267,7 +269,7 @@ func (s *Store) loadData(d *fileData) error {
 				return fmt.Errorf("学生 %s 的已撤销免修 %s 原依据为空", w.StudentID, w.ID)
 			}
 		}
-		key := reqKey(w.StudentID, w.ID)
+		key := ownerKey{w.StudentID, w.ID}
 		if _, dup := s.waiverByKey[key]; dup {
 			return fmt.Errorf("学生 %s 的免修编号 %s 重复", w.StudentID, w.ID)
 		}

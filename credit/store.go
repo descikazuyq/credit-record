@@ -93,20 +93,28 @@ type Store struct {
 	enrollments  []*Enrollment
 	waivers      []*Waiver
 
+	// 归属索引一律按字段逐一匹配，绝不能把学生编号与要求编号拼成一个
+	// 字符串再比较：编号是任意字符串，本身可能含有空字符（U+0000），
+	// 用任何分隔符拼接都会让 (学生 "s", 要求 "x\x00r") 与 (学生 "s\x00x",
+	// 要求 "r") 这类属于不同学生的两项撞成同一键，造成重复误判或跨学生
+	// 借用要求。
 	courseByID    map[string]*Course
 	studentByID   map[string]*Student
-	reqByKey      map[string]*Requirement // student + "\x00" + reqID
-	reqByDup      map[string]string       // student + "\x00" + course -> reqID
-	enrByKey      map[string]*Enrollment  // student + "\x00" + enrID
-	waiverByKey   map[string]*Waiver      // student + "\x00" + waiverID
+	reqByKey      map[ownerKey]*Requirement
+	reqByDup      map[ownerKey]string // (学生, 课程) -> 要求编号
+	enrByKey      map[ownerKey]*Enrollment
+	waiverByKey   map[ownerKey]*Waiver
 	nextResultSeq int
 	// dirty 记录自加载以来是否发生过需要落盘的变更（新建被拒绝的免修也算）。
 	dirty bool
 }
 
-func reqKey(student, id string) string { return student + "\x00" + id }
-func dupKey(student, course string) string {
-	return student + "\x00" + course
+// ownerKey 是“某学生名下某项记录”的归属键，两个字段分别按原文比较。
+// 用结构体而非拼接字符串，使含空字符的编号也不会跨字段错位碰撞；
+// 编号原文始终保留，不做删除、转义或改写。
+type ownerKey struct {
+	student string
+	id      string
 }
 
 func newStore() *Store {
@@ -118,10 +126,10 @@ func newStore() *Store {
 func (s *Store) resetIndexes() {
 	s.courseByID = map[string]*Course{}
 	s.studentByID = map[string]*Student{}
-	s.reqByKey = map[string]*Requirement{}
-	s.reqByDup = map[string]string{}
-	s.enrByKey = map[string]*Enrollment{}
-	s.waiverByKey = map[string]*Waiver{}
+	s.reqByKey = map[ownerKey]*Requirement{}
+	s.reqByDup = map[ownerKey]string{}
+	s.enrByKey = map[ownerKey]*Enrollment{}
+	s.waiverByKey = map[ownerKey]*Waiver{}
 }
 
 // NewStore 返回空记录集。
@@ -147,7 +155,7 @@ func (s *Store) Students() []*Student { return append([]*Student(nil), s.student
 
 // Requirement 返回某学生名下的要求；不存在（包括要求属于其他学生）返回 nil。
 func (s *Store) Requirement(student, reqID string) *Requirement {
-	return s.reqByKey[reqKey(student, reqID)]
+	return s.reqByKey[ownerKey{student, reqID}]
 }
 
 // Requirements 返回某学生的全部要求（按登记顺序）；学生不存在返回 nil。
@@ -171,7 +179,7 @@ func (s *Store) AllRequirements() []*Requirement {
 
 // Enrollment 返回某学生名下的修读；不存在返回 nil。
 func (s *Store) Enrollment(student, id string) *Enrollment {
-	return s.enrByKey[reqKey(student, id)]
+	return s.enrByKey[ownerKey{student, id}]
 }
 
 // Enrollments 返回某学生的全部修读（按登记顺序）；学生不存在返回 nil。
@@ -190,7 +198,7 @@ func (s *Store) Enrollments(student string) []*Enrollment {
 
 // Waiver 返回某学生名下的免修申请；不存在返回 nil。
 func (s *Store) Waiver(student, id string) *Waiver {
-	return s.waiverByKey[reqKey(student, id)]
+	return s.waiverByKey[ownerKey{student, id}]
 }
 
 // Waivers 返回某学生的全部免修历史（按申请顺序）；学生不存在返回 nil。
@@ -318,7 +326,7 @@ func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requiremen
 	if c == nil {
 		return nil, "", fmt.Errorf("课程 %s 不存在，不能登记课程要求", courseID)
 	}
-	if existing := s.reqByKey[reqKey(studentID, reqID)]; existing != nil {
+	if existing := s.reqByKey[ownerKey{studentID, reqID}]; existing != nil {
 		if existing.CourseID != courseID {
 			return nil, "", fmt.Errorf(
 				"学生 %s 的要求编号 %s 已指向课程 %s，不能改指课程 %s",
@@ -326,14 +334,14 @@ func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requiremen
 		}
 		return existing, ActionExisted, nil
 	}
-	if otherID, ok := s.reqByDup[dupKey(studentID, courseID)]; ok {
+	if otherID, ok := s.reqByDup[ownerKey{studentID, courseID}]; ok {
 		return nil, "", fmt.Errorf(
 			"学生 %s 已就课程 %s 建立要求 %s，不能重复建立", studentID, courseID, otherID)
 	}
 	r = &Requirement{ID: reqID, StudentID: studentID, CourseID: courseID}
 	s.requirements = append(s.requirements, r)
-	s.reqByKey[reqKey(studentID, reqID)] = r
-	s.reqByDup[dupKey(studentID, courseID)] = reqID
+	s.reqByKey[ownerKey{studentID, reqID}] = r
+	s.reqByDup[ownerKey{studentID, courseID}] = reqID
 	s.dirty = true
 	return r, ActionCreated, nil
 }
@@ -358,11 +366,11 @@ func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollme
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, "", fmt.Errorf("学生 %s 不存在，不能登记修读", studentID)
 	}
-	r := s.reqByKey[reqKey(studentID, reqID)]
+	r := s.reqByKey[ownerKey{studentID, reqID}]
 	if r == nil {
 		return nil, "", fmt.Errorf("学生 %s 名下不存在要求 %s，不能登记修读", studentID, reqID)
 	}
-	if existing := s.enrByKey[reqKey(studentID, enrID)]; existing != nil {
+	if existing := s.enrByKey[ownerKey{studentID, enrID}]; existing != nil {
 		if existing.ReqID != reqID || existing.Term != term {
 			return nil, "", fmt.Errorf(
 				"学生 %s 的修读编号 %s 已用于要求 %s、学期 %s，不能改为要求 %s、学期 %s",
@@ -378,7 +386,7 @@ func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollme
 		ID: enrID, StudentID: studentID, ReqID: reqID, Term: term, Result: Enrolled,
 	}
 	s.enrollments = append(s.enrollments, e)
-	s.enrByKey[reqKey(studentID, enrID)] = e
+	s.enrByKey[ownerKey{studentID, enrID}] = e
 	s.dirty = true
 	return e, ActionCreated, nil
 }
@@ -395,7 +403,7 @@ func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollm
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, false, fmt.Errorf("学生 %s 不存在", studentID)
 	}
-	e = s.enrByKey[reqKey(studentID, enrID)]
+	e = s.enrByKey[ownerKey{studentID, enrID}]
 	if e == nil {
 		return nil, false, fmt.Errorf("学生 %s 名下不存在修读 %s", studentID, enrID)
 	}
@@ -434,7 +442,7 @@ func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, "", fmt.Errorf("学生 %s 不存在，不能申请免修", studentID)
 	}
-	if existing := s.waiverByKey[reqKey(studentID, waiverID)]; existing != nil {
+	if existing := s.waiverByKey[ownerKey{studentID, waiverID}]; existing != nil {
 		if existing.ReqID != reqID || existing.Basis != basis {
 			return nil, "", fmt.Errorf(
 				"学生 %s 的免修编号 %s 已存在（要求 %s、依据 %q），提交内容不同，拒绝修改",
@@ -445,7 +453,7 @@ func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver
 
 	w = &Waiver{ID: waiverID, StudentID: studentID, ReqID: reqID, Basis: basis}
 	switch {
-	case s.reqByKey[reqKey(studentID, reqID)] == nil:
+	case s.reqByKey[ownerKey{studentID, reqID}] == nil:
 		w.Status = WaiverRejected
 		w.Reason = fmt.Sprintf("目标要求 %s 不存在或不属于该学生", reqID)
 	case basis == "":
@@ -460,7 +468,7 @@ func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver
 		w.Status = WaiverApproved
 	}
 	s.waivers = append(s.waivers, w)
-	s.waiverByKey[reqKey(studentID, waiverID)] = w
+	s.waiverByKey[ownerKey{studentID, waiverID}] = w
 	s.dirty = true
 	return w, ActionCreated, nil
 }
@@ -485,7 +493,7 @@ func (s *Store) RevokeWaiver(studentID, waiverID, reason string) (w *Waiver, cha
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, false, fmt.Errorf("学生 %s 不存在", studentID)
 	}
-	w = s.waiverByKey[reqKey(studentID, waiverID)]
+	w = s.waiverByKey[ownerKey{studentID, waiverID}]
 	if w == nil {
 		return nil, false, fmt.Errorf("学生 %s 名下不存在免修 %s，不能撤销", studentID, waiverID)
 	}
