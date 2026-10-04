@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // recordVersion 是当前记录文件格式版本。
@@ -219,7 +220,8 @@ func (s *Store) loadData(d *fileData) error {
 		s.enrByKey[key] = e
 	}
 
-	// 免修（被拒绝的申请允许指向当时不存在的要求）
+	// 免修（被拒绝的申请允许指向当时不存在的要求、依据也可以为空；
+	// 已撤销的申请则必须保留一份曾经有效的申请所必需的信息）
 	approvedReq := map[string]string{} // student+"\x00"+req -> waiverID
 	for _, w := range d.Waivers {
 		if w == nil {
@@ -236,7 +238,8 @@ func (s *Store) loadData(d *fileData) error {
 		default:
 			return fmt.Errorf("学生 %s 的免修 %s 含非法状态 %q", w.StudentID, w.ID, w.Status)
 		}
-		if w.Status == WaiverApproved {
+		switch w.Status {
+		case WaiverApproved:
 			if w.Basis == "" {
 				return fmt.Errorf("有效免修 %s 缺少依据", w.ID)
 			}
@@ -249,6 +252,20 @@ func (s *Store) loadData(d *fileData) error {
 					w.StudentID, w.ReqID, other, w.ID)
 			}
 			approvedReq[rk] = w.ID
+		case WaiverRevoked:
+			// 撤销只取消免修对课程要求的满足作用，不能把缺少原依据、
+			// 失去要求归属的记录变成合法历史：目标要求必须真实存在于
+			// 该免修所属学生名下（同号要求只在其他学生名下不算），
+			// 原依据必须含有非空白内容。检查只读不写，依据中有实际
+			// 文字时原有空白一律保留，绝不为了通过检查改写保存下来
+			// 的材料内容。失效历史不参与有效免修的唯一性限制。
+			if s.reqByKey[reqKey(w.StudentID, w.ReqID)] == nil {
+				return fmt.Errorf("学生 %s 的已撤销免修 %s 目标要求无效（要求 %s 不存在于该学生名下）",
+					w.StudentID, w.ID, w.ReqID)
+			}
+			if strings.TrimSpace(w.Basis) == "" {
+				return fmt.Errorf("学生 %s 的已撤销免修 %s 原依据为空", w.StudentID, w.ID)
+			}
 		}
 		key := reqKey(w.StudentID, w.ID)
 		if _, dup := s.waiverByKey[key]; dup {
