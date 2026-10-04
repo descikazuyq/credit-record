@@ -1,6 +1,7 @@
 package credit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,12 @@ type fileData struct {
 // 回车），但完整记录结束后只要还有任何内容——多出的右花括号或右方括号、
 // 拼接的第二段 JSON、普通文字或没写完的 JSON 片段——都判为损坏并拒绝读取，
 // 绝不依据已读到的前半条记录继续办理业务。
+//
+// 同一个 JSON 对象内的字段名称也只能出现一次：无论重复的是学分、学生编号
+// 还是其他字段，也无论两个值是否相同，整份文件都判为损坏。规则同时适用于
+// 最外层对象与其中的每条记录，字段名以 JSON 解码后的文字比较（直接写出与
+// Unicode 转义同名仍算重复）；限制只针对同一对象，不同记录各自携带同名字段
+// 是正常结构，字符串值里提到字段名不算重复。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -52,8 +59,25 @@ func Load(path string) (s *Store, existed bool, err error) {
 		return nil, true, fmt.Errorf("记录文件 %s 存在但为空，内容已损坏，未做任何修改", path)
 	}
 
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false, fmt.Errorf("无法读取记录文件 %s：%w", path, err)
+	}
+
+	// 先在 token 流上检查同一 JSON 对象内是否出现重复字段名。标准库直接
+	// 解进结构体时会用后一个重复键静默覆盖前一个（例如课程写了两个
+	// credit，4 会被 9 悄悄顶替），这样的记录无法明确说明字段归属，必须
+	// 整份判为损坏，绝不能据此核对或办理。仅扫描第一份完整值，其后内容
+	// 仍由下方的“完整记录之后不得有多余内容”检查处理。
+	var dupErr *duplicateFieldError
+	if err := scanDuplicateKeys(bytes.NewReader(raw)); errors.As(err, &dupErr) {
+		return nil, true, fmt.Errorf(
+			"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 重复出现，字段归属无法确定），未做任何修改",
+			path, dupErr.field)
+	}
+
 	var data fileData
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&data); err != nil {
 		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（JSON 解析失败：%v），未做任何修改", path, err)
