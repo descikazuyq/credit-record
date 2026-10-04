@@ -95,18 +95,28 @@ type Store struct {
 
 	courseByID    map[string]*Course
 	studentByID   map[string]*Student
-	reqByKey      map[string]*Requirement // student + "\x00" + reqID
-	reqByDup      map[string]string       // student + "\x00" + course -> reqID
-	enrByKey      map[string]*Enrollment  // student + "\x00" + enrID
-	waiverByKey   map[string]*Waiver      // student + "\x00" + waiverID
+	reqByKey      map[ownerKey]*Requirement // (student, reqID)
+	reqByDup      map[ownerKey]string       // (student, course) -> reqID
+	enrByKey      map[ownerKey]*Enrollment  // (student, enrID)
+	waiverByKey   map[ownerKey]*Waiver      // (student, waiverID)
 	nextResultSeq int
 	// dirty 记录自加载以来是否发生过需要落盘的变更（新建被拒绝的免修也算）。
 	dirty bool
 }
 
-func reqKey(student, id string) string { return student + "\x00" + id }
-func dupKey(student, course string) string {
-	return student + "\x00" + course
+// ownerKey 是“所属学生编号 + 该学生名下编号”的复合键。两部分各自按完整
+// 文字参与比较，因此要求是否存在必须以所属学生和编号都完全一致为准。
+// 不能用 student + "\x00" + id 之类的字符串拼接：JSON 解码后的编号本身
+// 允许包含 U+0000 等任意字符，拼接键会把 ("s","x\x00r") 与 ("s\x00x","r")
+// 两项不同学生的记录混成同一键，导致合法文件被判重复或免修借用他人要求。
+type ownerKey struct {
+	student string
+	id      string
+}
+
+func reqKey(student, id string) ownerKey { return ownerKey{student, id} }
+func dupKey(student, course string) ownerKey {
+	return ownerKey{student, course}
 }
 
 func newStore() *Store {
@@ -118,10 +128,10 @@ func newStore() *Store {
 func (s *Store) resetIndexes() {
 	s.courseByID = map[string]*Course{}
 	s.studentByID = map[string]*Student{}
-	s.reqByKey = map[string]*Requirement{}
-	s.reqByDup = map[string]string{}
-	s.enrByKey = map[string]*Enrollment{}
-	s.waiverByKey = map[string]*Waiver{}
+	s.reqByKey = map[ownerKey]*Requirement{}
+	s.reqByDup = map[ownerKey]string{}
+	s.enrByKey = map[ownerKey]*Enrollment{}
+	s.waiverByKey = map[ownerKey]*Waiver{}
 }
 
 // NewStore 返回空记录集。

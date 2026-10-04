@@ -222,7 +222,7 @@ func (s *Store) loadData(d *fileData) error {
 
 	// 免修（被拒绝的申请允许指向当时不存在的要求、依据也可以为空；
 	// 已撤销的申请则必须保留一份曾经有效的申请所必需的信息）
-	approvedReq := map[string]string{} // student+"\x00"+req -> waiverID
+	approvedReq := map[ownerKey]string{} // (student, req) -> waiverID
 	for _, w := range d.Waivers {
 		if w == nil {
 			return errors.New("存在空的免修记录")
@@ -245,7 +245,7 @@ func (s *Store) loadData(d *fileData) error {
 			}
 			rk := reqKey(w.StudentID, w.ReqID)
 			if s.reqByKey[rk] == nil {
-				return fmt.Errorf("有效免修 %s 指向不存在的要求 %s", w.ID, w.ReqID)
+				return fmt.Errorf("有效免修 %s 指向的要求 %s 不存在或不属于该学生", w.ID, w.ReqID)
 			}
 			if other, dup := approvedReq[rk]; dup {
 				return fmt.Errorf("学生 %s 的要求 %s 同时存在有效免修 %s 与 %s",
