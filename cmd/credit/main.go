@@ -35,6 +35,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -89,8 +90,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
-	code, err := dispatch(store, cmd, cmdArgs, stdout)
+
+	// 业务输出先写入内存缓冲：只有本次变更成功落盘后才把登记、更新、提交、
+	// 撤销或被拒绝的结果呈现给用户。保存失败时缓冲整段丢弃，标准输出不出现
+	// 任何尚未写入文件的业务结论，避免“提示成功、文件里却没有”的误导。
+	// 不产生落盘变更的命令（只读核对/查询、纯幂等重复、未落数据的业务拒绝）
+	// 不触发保存，输出照常直接呈现。
+	var business bytes.Buffer
+	code, err := dispatch(store, cmd, cmdArgs, &business)
 	if err != nil {
+		// 业务拒绝且没有新增记录：缓冲中没有需要落盘的内容，直接输出
+		// （dispatch 的处理器只在成功路径写 stdout，缓冲此时为空）。
 		fmt.Fprintf(stderr, "错误：%v\n", err)
 	}
 
@@ -100,12 +110,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// 就已返回，绝不会走到这里覆盖原文件。
 	if store.Dirty() {
 		if saveErr := store.Save(*file); saveErr != nil {
-			fmt.Fprintf(stderr, "错误：保存记录文件失败：%v\n", saveErr)
+			// 保存失败：丢弃全部业务输出，只在标准错误报告保存失败与目标
+			// 文件，并以文件错误退出；已有记录文件由原子保存保证原样保留，
+			// 原本不存在的文件也不会被宣称“已创建”。
+			fmt.Fprintf(stderr, "错误：保存记录文件 %s 失败：%v\n", *file, saveErr)
 			return exitFile
 		}
+		// 保存成功后才输出业务结果；首次创建说明放在业务结果之后。
+		// 写入标准输出的错误（如下游提前关闭管道）沿用既往做法忽略：
+		// 记录既已落盘，不应把输出中断误报成记录文件错误。
+		_, _ = business.WriteTo(stdout)
 		if !existed {
 			fmt.Fprintf(stdout, "（记录文件 %s 不存在，已从空记录开始并创建）\n", *file)
 		}
+	} else {
+		// 无落盘变更（只读、幂等、业务错误）：缓冲内容直接呈现。
+		_, _ = business.WriteTo(stdout)
 	}
 	return code
 }
