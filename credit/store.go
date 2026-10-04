@@ -119,6 +119,16 @@ func dupKey(student, course string) ownerKey {
 	return ownerKey{student, course}
 }
 
+// blankBasis 报告一份免修依据是否不含任何实际文字：空字符串，或全部由空白
+// 字符组成。空白按 Unicode 判定，除空格、制表符、换行、回车外还包括全角
+// 空格（U+3000）、不换行空格（U+00A0）等，混合使用这些字符仍算没有依据。
+//
+// 该判定只用于读取校验，绝不修剪或改写已保存的依据原文——依据中含有实际
+// 文字时，其前后与中间原有的空白必须原样保留在免修历史中。
+func blankBasis(basis string) bool {
+	return strings.TrimSpace(basis) == ""
+}
+
 func newStore() *Store {
 	s := &Store{}
 	s.resetIndexes()
@@ -458,7 +468,7 @@ func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver
 	case s.reqByKey[reqKey(studentID, reqID)] == nil:
 		w.Status = WaiverRejected
 		w.Reason = fmt.Sprintf("目标要求 %s 不存在或不属于该学生", reqID)
-	case basis == "":
+	case blankBasis(basis):
 		w.Status = WaiverRejected
 		w.Reason = "免修依据为空"
 	default:

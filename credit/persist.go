@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // recordVersion 是当前记录文件格式版本。
@@ -42,6 +41,13 @@ type fileData struct {
 // 最外层对象与其中的每条记录，字段名以 JSON 解码后的文字比较（直接写出与
 // Unicode 转义同名仍算重复）；限制只针对同一对象，不同记录各自携带同名字段
 // 是正常结构，字符串值里提到字段名不算重复。
+//
+// 有效免修的依据校验与首次正常申请一致：任何状态为有效（approved）的免修，
+// 其依据必须含有实际文字；依据为空，或全部由空白字符（空格、制表符、换行、
+// 回车、全角空格 U+3000、不换行空格 U+00A0 等，允许混用）组成时，整份记录
+// 按内容损坏拒绝读取，即使该要求另有通过修读也不例外。已拒绝申请的依据允许
+// 为空或只有空白。检查只读不写：不会补填依据、不会改动免修状态，也不会修剪
+// 含实际文字的依据中原有空白。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -240,8 +246,15 @@ func (s *Store) loadData(d *fileData) error {
 		}
 		switch w.Status {
 		case WaiverApproved:
-			if w.Basis == "" {
-				return fmt.Errorf("有效免修 %s 缺少依据", w.ID)
+			// 有效免修的依据校验与首次正常申请完全一致：依据必须含有实际
+			// 文字，空串或全部由空白字符（空格、制表符、换行、全角空格
+			// U+3000、不换行空格 U+00A0 等，含混用）组成都按内容损坏
+			// 拒绝整份记录——这样的“有效免修”无法有据可查，即使该要求
+			// 另有通过修读也不能放过。检查只读不写，绝不修剪或改写文件
+			// 中已保存的依据原文，也不把它降级成已拒绝/已撤销。
+			if blankBasis(w.Basis) {
+				return fmt.Errorf("学生 %s 的有效免修 %s 缺少依据（依据为空或全部为空白字符）",
+					w.StudentID, w.ID)
 			}
 			rk := reqKey(w.StudentID, w.ReqID)
 			if s.reqByKey[rk] == nil {
@@ -256,14 +269,16 @@ func (s *Store) loadData(d *fileData) error {
 			// 撤销只取消免修对课程要求的满足作用，不能把缺少原依据、
 			// 失去要求归属的记录变成合法历史：目标要求必须真实存在于
 			// 该免修所属学生名下（同号要求只在其他学生名下不算），
-			// 原依据必须含有非空白内容。检查只读不写，依据中有实际
-			// 文字时原有空白一律保留，绝不为了通过检查改写保存下来
-			// 的材料内容。失效历史不参与有效免修的唯一性限制。
+			// 原依据必须含有非空白内容（空白口径与有效免修一致，全角
+			// 空格、不换行空格等同样不算实际依据）。检查只读不写，
+			// 依据中有实际文字时原有空白一律保留，绝不为了通过检查
+			// 改写保存下来的材料内容。失效历史不参与有效免修的唯一
+			// 性限制。
 			if s.reqByKey[reqKey(w.StudentID, w.ReqID)] == nil {
 				return fmt.Errorf("学生 %s 的已撤销免修 %s 目标要求无效（要求 %s 不存在于该学生名下）",
 					w.StudentID, w.ID, w.ReqID)
 			}
-			if strings.TrimSpace(w.Basis) == "" {
+			if blankBasis(w.Basis) {
 				return fmt.Errorf("学生 %s 的已撤销免修 %s 原依据为空", w.StudentID, w.ID)
 			}
 		}
