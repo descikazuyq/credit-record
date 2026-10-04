@@ -295,6 +295,75 @@ func TestCLICorruptFileNotOverwritten(t *testing.T) {
 	}
 }
 
+// TestCLITrailingContentRejectedForReadAndWrite 合法记录后面多出内容时，无论
+// 本次是只读核对还是会写入的登记，都必须以文件错误退出码 2 结束：不产生任何
+// 业务成功信息、不用已读到的前半份记录返回核对结果、也不把异常文件覆盖成
+// 一份看似正常的新记录；原文件的每个字节都要保留。
+func TestCLITrailingContentRejectedForReadAndWrite(t *testing.T) {
+	// 一份可正常核对的合法记录：s1 有一门 4 学分课程并已通过。
+	good := "{\n  \"version\": 1,\n  \"courses\": [\n" +
+		"    {\"id\": \"c1\", \"name\": \"数学\", \"credit\": 4, \"open\": true}\n  ],\n" +
+		"  \"students\": [\n    {\"id\": \"s1\"}\n  ],\n" +
+		"  \"requirements\": [\n" +
+		"    {\"student\": \"s1\", \"id\": \"r1\", \"course\": \"c1\"}\n  ],\n" +
+		"  \"enrollments\": [\n" +
+		"    {\"student\": \"s1\", \"req\": \"r1\", \"term\": \"2024春\", \"id\": \"e1\"," +
+		" \"result\": \"passed\", \"resultSeq\": 1}\n  ],\n" +
+		"  \"waivers\": null,\n  \"nextResultSeq\": 1\n}\n"
+
+	tails := map[string]string{
+		"多余右花括号":     "}",
+		"多余右方括号":     "]",
+		"拼接第二份记录":    `{"version":1}`,
+		"尾部普通文字":     "未完待续",
+		"未写完的JSON片段": ` {"version":`,
+	}
+	for name, tail := range tails {
+		t.Run(name, func(t *testing.T) {
+			content := good + tail
+			file := filepath.Join(t.TempDir(), "records.json")
+			if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			// 只读核对：不能返回基于前半份记录的核对结果，不能显示总学分。
+			out, errText, code := runCLI(t, file, "check", "s1")
+			if code != exitFile {
+				t.Fatalf("%s：只读核对遇尾部内容应退出码 %d，code=%d out=%q err=%q",
+					name, exitFile, code, out, errText)
+			}
+			if out != "" {
+				t.Fatalf("%s：拒绝读取时不应有任何业务输出，out=%q", name, out)
+			}
+			if !strings.Contains(errText, "内容损坏") || !strings.Contains(errText, file) {
+				t.Fatalf("%s：错误输出应说明文件损坏并点名问题文件，err=%q", name, errText)
+			}
+
+			// 登记学生（会触发写入）：不能报告登记成功，更不能覆盖异常原文件。
+			out, errText, code = runCLI(t, file, "student", "s9")
+			if code != exitFile {
+				t.Fatalf("%s：写入类操作遇尾部内容应退出码 %d，code=%d out=%q err=%q",
+					name, exitFile, code, out, errText)
+			}
+			if strings.Contains(out, "已登记学生") || strings.Contains(out, "成功") {
+				t.Fatalf("%s：不应出现业务成功信息，out=%q", name, out)
+			}
+			if !strings.Contains(errText, "内容损坏") {
+				t.Fatalf("%s：应向错误输出说明内容损坏，err=%q", name, errText)
+			}
+
+			got, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Fatalf("%s：原文件内容（含尾部异常）必须原样保留\nwant=%q\n got=%q",
+					name, content, got)
+			}
+		})
+	}
+}
+
 func TestCLIReadOnlyDoesNotCreateFile(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "deep", "records.json")
 

@@ -3,6 +3,7 @@ package credit
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -169,6 +170,116 @@ func TestLoadCorruptAndUnreadableNotOverwritten(t *testing.T) {
 		if os.Getuid() != 0 {
 			t.Fatal("不可读文件应报错")
 		}
+	}
+}
+
+// TestLoadRejectsTrailingGarbage 完整记录结束后只要还有任何内容，就必须判为
+// 损坏并拒绝读取：多出的右花括号/右方括号不能被忽略，后面拼接另一段即使
+// 本身合法的 JSON 也不能作为第二份记录，普通文字或没写完的 JSON 片段同样
+// 拒绝。错误信息要能定位文件并说明尾部有多余内容，且文件原始字节（含多余
+// 符号、文字与空白）必须原样保留。
+func TestLoadRejectsTrailingGarbage(t *testing.T) {
+	// 开头是一份结构、引用完全合法的记录，不能因为它能解析就接受整份文件。
+	good := `{"version":1,"students":[{"id":"s1"}],` +
+		`"courses":[{"id":"c1","name":"数学","credit":4,"open":true}],` +
+		`"requirements":[{"id":"r1","student":"s1","course":"c1"}],` +
+		`"enrollments":[],"waivers":[],"nextResultSeq":0}`
+
+	cases := map[string]string{
+		"尾部多余右花括号":     good + "}",
+		"尾部多余右方括号":     good + "]",
+		"括号前带空白仍拒绝":    good + " \t }",
+		"尾部拼接第二份JSON":  good + good,
+		"尾部拼接空数组":      good + "[]",
+		"尾部拼接空对象":      good + "{}",
+		"尾部拼接数字":       good + " 42",
+		"尾部拼接字符串":      good + ` "x"`,
+		"尾部普通文字":       good + "普通文字",
+		"尾部未写完的对象片段":   good + ` {"version":`,
+		"尾部未写完的数组片段":   good + " [1, 2,",
+		"尾部多余花括号后再跟空白": good + "}\n  \t\r\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "records.json")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, existed, err := Load(path)
+			if err == nil {
+				t.Fatalf("%s：尾部有多余内容应判损坏并拒绝，却得到 store=%v", name, s)
+			}
+			if !existed {
+				t.Fatalf("%s：损坏文件应标记为已存在", name)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, path) {
+				t.Fatalf("%s：错误信息应点名问题文件，得到：%v", name, err)
+			}
+			if !strings.Contains(msg, "内容损坏") || !strings.Contains(msg, "完整记录") {
+				t.Fatalf("%s：错误信息应说明完整记录之后有多余内容，得到：%v", name, err)
+			}
+			got, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(got) != content {
+				t.Fatalf("%s：拒绝读取不得截断或改写原文件\nwant=%q\n got=%q", name, content, got)
+			}
+		})
+	}
+}
+
+// TestLoadAllowsWhitespaceAroundSingleRecord 唯一一份完整记录的前后允许
+// 空格、制表符、换行与回车；正常保存（末尾带换行）与既有读取/核对行为
+// 必须保持兼容。
+func TestLoadAllowsWhitespaceAroundSingleRecord(t *testing.T) {
+	s := NewStore()
+	mustStudent(t, s, "s1")
+	mustCourse(t, s, "c1", "数学", 4)
+	mustReq(t, s, "s1", "r1", "c1")
+	mustEnroll(t, s, "s1", "r1", "2024春", "e1")
+	if _, _, err := s.SubmitResult("s1", "e1", Passed); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := s.Save(filepath.Join(dir, "r.json")); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "r.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Save 自身以换行结尾，重新加载必须正常（回归保障）。
+	if loaded, _, err := Load(filepath.Join(dir, "r.json")); err != nil {
+		t.Fatalf("正常保存的文件应可加载：%v", err)
+	} else if rep := loaded.CheckStudent("s1"); rep.TotalCredits != 4 {
+		t.Fatalf("正常文件核对应得 4 学分，得到 %d", rep.TotalCredits)
+	}
+
+	body := strings.TrimRight(string(raw), "\r\n")
+	cases := map[string]string{
+		"末尾换行":   body + "\n",
+		"末尾CRLF": body + "\r\n",
+		"前后空白组合": "  \t\r\n " + body + " \t\r\n  ",
+		"仅前导空白":  "\t\n " + body,
+		"无任何空白":  body,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "records.json")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, existed, err := Load(path)
+			if err != nil || !existed {
+				t.Fatalf("%s：记录前后的合法空白不应导致拒绝，existed=%v err=%v", name, existed, err)
+			}
+			rep := loaded.CheckStudent("s1")
+			if rep.TotalCredits != 4 || len(rep.Unmet) != 0 {
+				t.Fatalf("%s：应正常读取并核对到 4 学分、要求已满足，得到 %+v", name, rep)
+			}
+		})
 	}
 }
 

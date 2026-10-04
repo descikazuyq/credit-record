@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -28,6 +29,11 @@ type fileData struct {
 // 文件存在但无法读取（权限、I/O 错误等）或内容损坏（非法 JSON、结构矛盾、
 // 引用悬空等）时返回错误，调用方绝不应把该文件当作空记录覆盖写入。
 // 空文件同样视为损坏，而不是空记录。
+//
+// 整份文件必须只含一条完整记录：记录前后允许空白（空格、制表符、换行、
+// 回车），但完整记录结束后只要还有任何内容——多出的右花括号或右方括号、
+// 拼接的第二段 JSON、普通文字或没写完的 JSON 片段——都判为损坏并拒绝读取，
+// 绝不依据已读到的前半条记录继续办理业务。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -52,9 +58,20 @@ func Load(path string) (s *Store, existed bool, err error) {
 	if err := dec.Decode(&data); err != nil {
 		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（JSON 解析失败：%v），未做任何修改", path, err)
 	}
-	// 不允许同一文件中拼接多段 JSON。
-	if dec.More() {
-		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（含有多余数据），未做任何修改", path)
+	// 完整记录之后必须只剩下空白：再解一条原始 JSON，仅 io.EOF 表示记录后
+	// 别无他物。不能用 dec.More() 判断——它只向前看“值起始”标记，记录后
+	// 多出的右花括号/右方括号会让 More() 直接返回 false 而被漏掉。再次
+	// Decode 能覆盖全部情形：成功读到值说明后面拼接了第二段 JSON；返回
+	// 语法错误或 unexpected EOF 说明尾部有孤立括号、普通文字或未写完的
+	// 片段。这些一律视为文件损坏。
+	var extra json.RawMessage
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		// 唯一一份完整记录之后只有空白，符合格式。
+	case err == nil:
+		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（完整记录之后还拼接了其他 JSON 数据），未做任何修改", path)
+	default:
+		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（完整记录之后仍有无法解析的多余内容），未做任何修改", path)
 	}
 
 	s = NewStore()
