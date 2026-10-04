@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // recordVersion 是当前记录文件格式版本。
@@ -41,6 +42,13 @@ type fileData struct {
 // 最外层对象与其中的每条记录，字段名以 JSON 解码后的文字比较（直接写出与
 // Unicode 转义同名仍算重复）；限制只针对同一对象，不同记录各自携带同名字段
 // 是正常结构，字符串值里提到字段名不算重复。
+//
+// 已撤销免修仍须保留一份曾经有效的申请所必需的信息：目标要求必须真实存在
+// 于该免修所属学生名下（要求编号为空、要求不存在、同号要求只属于另一名学生
+// 都不通过），原依据必须含非空白内容（空串或全为空格/制表符/换行都不通过；
+// 含实际文字时依据内原有空白原样保留，检查不改写材料）。已撤销只取消它对
+// 要求的满足作用，不能让失去要求归属或缺少原依据的记录成为合法历史。被拒绝
+// 的申请允许因要求不存在或依据为空而留下记录与原拒绝原因，不受此限。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -219,7 +227,18 @@ func (s *Store) loadData(d *fileData) error {
 		s.enrByKey[key] = e
 	}
 
-	// 免修（被拒绝的申请允许指向当时不存在的要求）
+	// 免修：
+	//   - approved（有效）：依据非空、目标要求必须存在于该学生名下；同一学生
+	//     同一要求只能有一份有效免修；
+	//   - revoked（已撤销）：撤销只取消它对要求的满足作用，曾经有效的申请所
+	//     必需的信息仍须保留——目标要求必须真实存在于该学生名下（要求编号为
+	//     空、要求根本不存在、同号要求只属于另一名学生都不通过），原依据必须
+	//     含非空白内容（缺失、空串或全为空格/制表符/换行都不通过）；
+	//   - rejected（已拒绝）：允许指向当时不存在的要求、允许依据为空——申请
+	//     被拒绝本身就可能是因为要求不存在或依据为空，这类正常历史不能按
+	//     已撤销记录的条件误判为文件损坏。
+	// 检查只读取内容、不改动记录：依据中实际文字两侧及内部原有的空白都原样
+	// 保留，不为检查而改写保存下来的材料。
 	approvedReq := map[string]string{} // student+"\x00"+req -> waiverID
 	for _, w := range d.Waivers {
 		if w == nil {
@@ -236,6 +255,9 @@ func (s *Store) loadData(d *fileData) error {
 		default:
 			return fmt.Errorf("学生 %s 的免修 %s 含非法状态 %q", w.StudentID, w.ID, w.Status)
 		}
+		// 有效免修沿用原有检查与报错；已撤销免修同样必须保留一份曾经有效的
+		// 申请所必需的信息（本人名下真实存在的要求 + 含实际文字的依据），
+		// 只是它不再参与要求满足。被拒绝的申请不受此限（见上方说明）。
 		if w.Status == WaiverApproved {
 			if w.Basis == "" {
 				return fmt.Errorf("有效免修 %s 缺少依据", w.ID)
@@ -249,6 +271,19 @@ func (s *Store) loadData(d *fileData) error {
 					w.StudentID, w.ReqID, other, w.ID)
 			}
 			approvedReq[rk] = w.ID
+		}
+		if w.Status == WaiverRevoked {
+			rk := reqKey(w.StudentID, w.ReqID)
+			if w.ReqID == "" || s.reqByKey[rk] == nil {
+				return fmt.Errorf(
+					"学生 %s 的已撤销免修 %s 目标要求无效：要求编号 %q 为空或不存在于该学生名下",
+					w.StudentID, w.ID, w.ReqID)
+			}
+			if strings.TrimSpace(w.Basis) == "" {
+				return fmt.Errorf(
+					"学生 %s 的已撤销免修 %s 原依据为空：缺少依据、空字符串或全为空白",
+					w.StudentID, w.ID)
+			}
 		}
 		key := reqKey(w.StudentID, w.ID)
 		if _, dup := s.waiverByKey[key]; dup {
