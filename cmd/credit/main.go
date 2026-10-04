@@ -35,6 +35,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -89,7 +90,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
-	code, err := dispatch(store, cmd, cmdArgs, stdout)
+
+	// 业务结果先写入缓冲区，只有本次变更真正落盘后才允许出现在标准输出：
+	// 保存失败时绝不能把尚未写入文件的登记、更新、提交、撤销说成已经完成。
+	// 只读命令、幂等重复等不产生变更的操作不会保存，其结果照常输出。
+	var biz bytes.Buffer
+	code, err := dispatch(store, cmd, cmdArgs, &biz)
 	if err != nil {
 		fmt.Fprintf(stderr, "错误：%v\n", err)
 	}
@@ -100,13 +106,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// 就已返回，绝不会走到这里覆盖原文件。
 	if store.Dirty() {
 		if saveErr := store.Save(*file); saveErr != nil {
-			fmt.Fprintf(stderr, "错误：保存记录文件失败：%v\n", saveErr)
+			// 保存没有完成：丢弃全部业务输出，只在标准错误点名保存失败与
+			// 目标记录文件，按文件错误退出码 2 结束，退出码优先级高于
+			// 业务拒绝（例如历史都没存上的被拒绝免修）。
+			fmt.Fprintf(stderr, "错误：保存记录文件 %s 失败：%v\n", *file, saveErr)
 			return exitFile
 		}
+		// 首次创建记录文件的说明放在业务结果之后；保存失败时不会出现，
+		// 也不会谎称已经创建。
+		fmt.Fprint(stdout, biz.String())
 		if !existed {
 			fmt.Fprintf(stdout, "（记录文件 %s 不存在，已从空记录开始并创建）\n", *file)
 		}
+		return code
 	}
+	fmt.Fprint(stdout, biz.String())
 	return code
 }
 
