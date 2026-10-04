@@ -131,6 +131,12 @@ func TestLoadCorruptAndUnreadableNotOverwritten(t *testing.T) {
 		"坏版本":  `{"version":99}` + "\n",
 		"多余字段": `{"version":1,"bogus":1}` + "\n",
 		"重复学生": `{"version":1,"students":[{"id":"s1"},{"id":"s1"}]}` + "\n",
+		// 完整记录之后的任何多余内容都视为损坏。
+		"尾部右花括号":  `{"version":1}}` + "\n",
+		"尾部右方括号":  `{"version":1}]` + "\n",
+		"尾部拼接JSON": `{"version":1} {"version":1}` + "\n",
+		"尾部普通文字":  `{"version":1} 垃圾内容` + "\n",
+		"尾部未完片段":  `{"version":1} {"version":` + "\n",
 	}
 	for name, content := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -169,6 +175,30 @@ func TestLoadCorruptAndUnreadableNotOverwritten(t *testing.T) {
 		if os.Getuid() != 0 {
 			t.Fatal("不可读文件应报错")
 		}
+	}
+}
+
+func TestLoadAllowsSurroundingWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "records.json")
+	content := " \t\r\n{\"version\":1,\"students\":[{\"id\":\"s1\"}]}\n\t \r\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, existed, err := Load(path)
+	if err != nil || !existed {
+		t.Fatalf("合法空白包裹的记录应正常读取：existed=%v err=%v", existed, err)
+	}
+	if s.Student("s1") == nil {
+		t.Fatal("学生未正确恢复")
+	}
+	// 只读加载不得改动原文件。
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Fatal("Load 不得改写原文件")
 	}
 }
 

@@ -1,9 +1,11 @@
 package credit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -25,9 +27,9 @@ type fileData struct {
 // Load 从 path 读取记录。
 //
 // 文件不存在时返回空记录集，existed=false，且不报错——即“从空记录开始”。
-// 文件存在但无法读取（权限、I/O 错误等）或内容损坏（非法 JSON、结构矛盾、
-// 引用悬空等）时返回错误，调用方绝不应把该文件当作空记录覆盖写入。
-// 空文件同样视为损坏，而不是空记录。
+// 文件存在但无法读取（权限、I/O 错误等）或内容损坏（非法 JSON、完整记录
+// 之后还有多余内容、结构矛盾、引用悬空等）时返回错误，调用方绝不应把该
+// 文件当作空记录覆盖写入。空文件同样视为损坏，而不是空记录。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -52,9 +54,17 @@ func Load(path string) (s *Store, existed bool, err error) {
 	if err := dec.Decode(&data); err != nil {
 		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（JSON 解析失败：%v），未做任何修改", path, err)
 	}
-	// 不允许同一文件中拼接多段 JSON。
-	if dec.More() {
-		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（含有多余数据），未做任何修改", path)
+	// 整个文件必须只含一份完整记录：记录结束后只允许空白
+	// （空格、制表符、换行、回车）。多出的右花括号/右方括号、拼接的
+	// 第二份 JSON、普通文字或未写完的片段，都视为文件损坏。
+	// 注意不能用 dec.More() 判断：它在遇到 } 或 ] 时会返回 false，
+	// 会把这类尾部内容漏掉。
+	rest, err := io.ReadAll(io.MultiReader(dec.Buffered(), f))
+	if err != nil {
+		return nil, true, fmt.Errorf("无法读取记录文件 %s：%w", path, err)
+	}
+	if len(bytes.Trim(rest, " \t\n\r")) > 0 {
+		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（完整记录之后存在多余内容），未做任何修改", path)
 	}
 
 	s = NewStore()
