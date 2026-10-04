@@ -240,8 +240,13 @@ func (s *Store) loadData(d *fileData) error {
 		}
 		switch w.Status {
 		case WaiverApproved:
-			if w.Basis == "" {
-				return fmt.Errorf("有效免修 %s 缺少依据", w.ID)
+			// 与正常申请同一规则：依据为空或只含空白字符（空格、制表符、
+			// 换行，以及全角空格、不换行空格等 Unicode 空白）都不算有据
+			// 可查，整份记录按内容损坏拒绝读取。检查只读不写：依据含有
+			// 实际文字时，前后或中间的空白一律原样保留，绝不修剪改写。
+			if strings.TrimSpace(w.Basis) == "" {
+				return fmt.Errorf("学生 %s 的有效免修 %s 缺少依据（依据为空或只含空白字符）",
+					w.StudentID, w.ID)
 			}
 			rk := reqKey(w.StudentID, w.ReqID)
 			if s.reqByKey[rk] == nil {
