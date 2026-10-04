@@ -1,6 +1,7 @@
 package credit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,12 @@ type fileData struct {
 // 回车），但完整记录结束后只要还有任何内容——多出的右花括号或右方括号、
 // 拼接的第二段 JSON、普通文字或没写完的 JSON 片段——都判为损坏并拒绝读取，
 // 绝不依据已读到的前半条记录继续办理业务。
+//
+// 同一个 JSON 对象内的字段名称只能出现一次：最外层与任意嵌套对象（单条
+// 课程、学生、要求、修读、免修记录）都适用，重复字段是否相邻、两个值是否
+// 相同都不影响判定。字段名以 JSON 解码后的文字比较，直接写出与 \uXXXX
+// 转义写出的同名仍算重复；依据、名称等字段的“值内容”里提到字段名不算
+// 重复。不同对象各自拥有同名字段（两门课程各有 credit）是正常记录。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -52,8 +59,21 @@ func Load(path string) (s *Store, existed bool, err error) {
 		return nil, true, fmt.Errorf("记录文件 %s 存在但为空，内容已损坏，未做任何修改", path)
 	}
 
+	// 先读入原始字节：一遍用 token 扫描器专门检查同一对象内的重复字段
+	// （encoding/json 默认“后者静默覆盖前者”，必须显式拦截），再交给
+	// Decoder 做常规解析、未知字段拒绝与尾部多余内容检查。
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, true, fmt.Errorf("无法读取记录文件 %s：%w", path, err)
+	}
+	if dupName, ok := duplicateObjectName(bytes.NewReader(raw)); ok {
+		return nil, true, fmt.Errorf(
+			"记录文件 %s 内容损坏（同一对象内字段 %q 重复出现，记录含义不明确），未做任何修改",
+			path, dupName)
+	}
+
 	var data fileData
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&data); err != nil {
 		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（JSON 解析失败：%v），未做任何修改", path, err)
@@ -79,6 +99,82 @@ func Load(path string) (s *Store, existed bool, err error) {
 		return nil, true, fmt.Errorf("记录文件 %s 内容损坏（%v），未做任何修改", path, err)
 	}
 	return s, true, nil
+}
+
+// duplicateObjectName 扫描一段完整 JSON，返回最先发现的“同一对象内重复
+// 字段”的名称；没有重复时 ok=false。语法错误不在此处理（调用方随后用
+// Decoder 解析并按损坏拒绝），扫描器读到语法错误即停止，返回“未发现
+// 重复”即可。
+//
+// Token() 返回的键名已是解码后的文字：用反斜杠 u 转义书写的键名
+// （例如 “\” 后接 “u0063” 再加 “redit”）会先解码成 credit，再与直写
+// 的同名键判重。检查的是对象键，字段值（依据、课程名称等字符串
+// 内容）里出现什么文字都不参与判重。每个对象单独持有一份名称集合，
+// 嵌套对象出栈即恢复，不同对象的同名字段互不影响。
+func duplicateObjectName(r io.Reader) (string, bool) {
+	dec := json.NewDecoder(r)
+	// frame 描述一层容器：对象记录已见字段名并跟踪下一个字符串是否为键；
+	// 数组没有键，两个字段都不用。
+	type frame struct {
+		isObject  bool
+		expectKey bool
+		seen      map[string]bool
+	}
+	var stack []*frame
+	top := func() *frame {
+		if len(stack) == 0 {
+			return nil
+		}
+		return stack[len(stack)-1]
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// io.EOF 或语法错误：语法错误交给后续正式解析判定。
+			return "", false
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			switch v {
+			case '{':
+				// 空对象的下一个字符串也是键。
+				stack = append(stack, &frame{
+					isObject:  true,
+					expectKey: true,
+					seen:      map[string]bool{},
+				})
+			case '[':
+				stack = append(stack, &frame{})
+			case '}', ']':
+				stack = stack[:len(stack)-1]
+				// 刚闭合的对象/数组本身是父对象的一个值，父对象接下来
+				// 只能遇到闭合括号或新的键名。
+				if p := top(); p != nil && p.isObject {
+					p.expectKey = true
+				}
+			}
+		case string:
+			f := top()
+			if f == nil || !f.isObject {
+				continue // 数组中的字符串元素，与判重无关。
+			}
+			if f.expectKey {
+				if f.seen[v] {
+					return v, true
+				}
+				f.seen[v] = true
+				f.expectKey = false // 键之后是值。
+			} else {
+				// 字符串本身作为值，值结束后下一个 token 只能是 } 或键。
+				f.expectKey = true
+			}
+		default:
+			// number / bool / null 作为值：父对象随后期待 } 或新键名。
+			if f := top(); f != nil && f.isObject {
+				f.expectKey = true
+			}
+		}
+	}
 }
 
 // loadData 校验磁盘数据并重建索引；任何矛盾都作为损坏报错。
