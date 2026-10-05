@@ -503,9 +503,15 @@ func (s *Store) validWaiver(studentID, reqID string) *Waiver {
 // RevokeWaiver 撤销有效免修，原依据与撤销状态保留；reason 可填撤销原因。
 // 重复撤销已撤销的免修：原样返回、changed=false，不改变结果。
 // 撤销不存在的编号或撤销已被拒绝的申请：明确拒绝。
+//
+// 学生编号与免修编号按用户给出的完整文字参与匹配，前后空白（普通空格、
+// 制表符、全角空格等）也是编号内容，绝不修剪：记录文件可以合法保存
+// “s1”与“ s1 ”两名学生、同一学生名下“w1”与“ w1 ”两份免修，撤销
+// 必须命中编号完全一致的那一份。完整编号找不到学生时报告学生不存在；
+// 学生存在但名下没有该完整免修编号时报告该免修不存在——即使去掉空白后
+// 能碰上另一名学生或另一份免修，也绝不借用那份记录，更不能改写原编号、
+// 合并申请或新增免修历史。撤销提示与免修历史一律使用实际命中的原编号。
 func (s *Store) RevokeWaiver(studentID, waiverID, reason string) (w *Waiver, changed bool, err error) {
-	studentID = strings.TrimSpace(studentID)
-	waiverID = strings.TrimSpace(waiverID)
 	reason = strings.TrimSpace(reason)
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, false, fmt.Errorf("学生 %s 不存在", studentID)
