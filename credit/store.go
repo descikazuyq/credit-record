@@ -448,11 +448,20 @@ func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollm
 // 返回的申请状态为 rejected（仍属于新建记录，action=created）。
 // 同一编号已存在：内容（要求、依据）完全相同时返回原申请及其结果
 // （已拒绝/已撤销的申请不会因重试重新生效）；内容不同则拒绝且不改动原申请。
+//
+// 学生编号、要求编号与免修编号按用户给出的完整文字参与匹配，前后空白
+// （普通空格、制表符、全角空格等）也是编号内容，绝不修剪：记录文件可以
+// 合法保存 “s1” 与 “ s1 ” 两名学生、同一学生名下 “r1” 与 “ r1 ” 两项
+// 要求、“w1” 与 “ w1 ” 两份申请，申请必须命中编号完全一致的那一项，
+// 已保存的编号原文也绝不为了匹配而改写或合并。完整编号找不到学生时
+// 直接报学生不存在（不留任何历史）；学生存在但名下没有该完整要求编号时
+// 按目标要求不存在拒绝，即使去掉空白后能碰上另一项要求也绝不借用——
+// 被拒绝的申请仍按原规则保存在申请人名下，保留其完整的要求编号、免修
+// 编号与拒绝原因。只有空字符串编号按“不能为空”拒绝。
+//
+// 依据同样不修剪：是否“没有实际文字”只由 blankBasis 判定（空字符串或
+// 全部由空白字符组成），依据含实际文字时其前后与中间的空白原样保存。
 func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver, action Action, err error) {
-	studentID = strings.TrimSpace(studentID)
-	reqID = strings.TrimSpace(reqID)
-	waiverID = strings.TrimSpace(waiverID)
-	basis = strings.TrimSpace(basis)
 	if studentID == "" || reqID == "" || waiverID == "" {
 		return nil, "", errors.New("学生编号、要求编号和免修编号不能为空")
 	}
