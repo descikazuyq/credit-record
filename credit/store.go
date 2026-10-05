@@ -440,19 +440,27 @@ func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollm
 
 // ---------- 免修 ----------
 
-// ApplyWaiver 提交免修申请，依据必须非空。
+// ApplyWaiver 提交免修申请，依据必须含实际文字。
 //
 // 首次提交且内容合法：状态为有效（approved），action=created。
-// 目标要求不存在（含要求属于其他学生）、依据为空、或该要求已有有效免修：
-// 申请被拒绝，但申请内容与具体原因保留在该学生的免修历史中，
+// 目标要求不存在（含要求属于其他学生）、依据不含实际文字、或该要求已有
+// 有效免修：申请被拒绝，但申请内容与具体原因保留在该学生的免修历史中，
 // 返回的申请状态为 rejected（仍属于新建记录，action=created）。
 // 同一编号已存在：内容（要求、依据）完全相同时返回原申请及其结果
 // （已拒绝/已撤销的申请不会因重试重新生效）；内容不同则拒绝且不改动原申请。
+//
+// 学生编号、要求编号与免修编号按用户给出的完整文字参与匹配，前后空白
+// （普通空格、制表符、全角空格等）也是编号内容，绝不修剪：记录文件可以
+// 合法保存 “s1” 与 “ s1 ” 两名学生、同一学生名下 “r1” 与 “ r1 ” 两项
+// 要求、“w1” 与 “ w1 ” 两份申请，提交必须命中编号完全一致的那一项，
+// 申请也必须登记在完整编号的申请人名下。完整编号找不到学生时直接按业务
+// 规则报错，不在任何学生名下新增历史；学生存在但名下没有该完整要求编号
+// 时，即使去掉空白能碰上另一项要求，也绝不借用那份记录，而是按原规则在
+// 申请人名下保存原要求编号、免修编号、依据原文与拒绝原因。编号为空字符串
+// 时直接拒绝，不创建申请。依据含实际文字时其中的空白（包括前后空白）
+// 原样保留；是否“没有依据”只按空白内容判定（见 blankBasis），绝不修剪
+// 或改写依据原文。
 func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver, action Action, err error) {
-	studentID = strings.TrimSpace(studentID)
-	reqID = strings.TrimSpace(reqID)
-	waiverID = strings.TrimSpace(waiverID)
-	basis = strings.TrimSpace(basis)
 	if studentID == "" || reqID == "" || waiverID == "" {
 		return nil, "", errors.New("学生编号、要求编号和免修编号不能为空")
 	}
