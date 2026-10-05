@@ -2,6 +2,7 @@ package credit
 
 import (
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -34,6 +35,10 @@ type Report struct {
 	// TotalCredits 已满足要求获得的学分之和；同一课程的多项要求各计一次，
 	// 同一要求无论通过多少次或同时有免修都只计一份。
 	TotalCredits int
+	// Overflow 为 true 表示按上述规则累加的总学分超出 int 可表示的最大值，
+	// 此时 TotalCredits 不是有效结果（既不截断也不回绕），核对必须被拒绝，
+	// 不能当作正常报告展示。
+	Overflow     bool
 	Requirements []RequirementStatus
 	// Unmet 是未满足的要求编号（保持 Requirements 中的顺序）。
 	Unmet []string
@@ -88,7 +93,14 @@ func (s *Store) CheckStudent(studentID string) Report {
 		}
 
 		if st.Satisfied && st.Course != nil {
-			rep.TotalCredits += st.Course.Credit
+			// 各门课程学分本身合法，但累加结果可能超出 int 上限：
+			// 一旦超限就标记 Overflow 并停止累加，绝不让总学分回绕成
+			// 负数或停留在部分累加的中间值被当作有效结果。
+			if rep.Overflow || st.Course.Credit > math.MaxInt-rep.TotalCredits {
+				rep.Overflow = true
+			} else {
+				rep.TotalCredits += st.Course.Credit
+			}
 		} else {
 			rep.Unmet = append(rep.Unmet, r.ID)
 		}

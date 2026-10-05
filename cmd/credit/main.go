@@ -40,6 +40,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -330,6 +331,15 @@ func cmdCheck(s *credit.Store, args []string, out io.Writer) (int, error) {
 	if !rep.Found {
 		// 没有记录的学生：明确的不存在结果，且不写任何数据。
 		return exitRejected, fmt.Errorf("%s", rep.String())
+	}
+	if rep.Overflow {
+		// 各门课程学分本身合法，但按计分规则累加的总学分超出学分整数
+		// 类型可表示的最大值：拒绝本次核对，不展示任何正常核对报告，
+		// 也不给出截断、回绕或只累加部分要求的总学分。这是业务拒绝
+		// （退出码 1），不是记录文件损坏；核对为只读，原文件保持不变。
+		return exitRejected, fmt.Errorf(
+			"学生 %s 已满足要求的总学分超出学分整数类型可表示的最大值 %d，无法完成核对",
+			rep.StudentID, math.MaxInt)
 	}
 	fmt.Fprint(out, rep.String())
 	return exitOK, nil
