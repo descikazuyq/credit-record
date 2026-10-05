@@ -364,13 +364,24 @@ func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requiremen
 // 相同（学生、修读编号、要求、学期）的重复登记返回原记录（幂等）；
 // 相同编号但要求或学期不同则拒绝；课程已停开时不能新增修读
 // （已登记记录的重复提交仍按幂等返回原记录）。
+//
+// 学生编号、要求编号与修读编号按用户给出的完整文字参与匹配，前后空白
+// （普通空格、制表符、全角空格等）也是编号内容，绝不修剪：记录文件可以
+// 合法保存 “s1” 与 “ s1 ” 两名学生、同一学生名下 “r1” 与 “ r1 ” 两项
+// 要求、“e1” 与 “ e1 ” 两份修读，登记必须命中编号完全一致的对象，新
+// 修读也必须登记在完整编号的学生与要求名下并保留完整编号。完整编号找
+// 不到学生时报告学生不存在；学生存在但名下没有该完整要求编号时报告本人
+// 名下没有该要求——即使去掉空白能碰上另一名学生或另一项要求，也绝不
+// 借用那份记录，更不能把修读登记到别人名下。编号为空字符串时直接拒绝；
+// 只由空白字符组成的修读编号不得建立。学期沿用现有输入规则：前后空白
+// 不计入学期内容，修剪后为空则拒绝。
 func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollment, action Action, err error) {
-	studentID = strings.TrimSpace(studentID)
-	reqID = strings.TrimSpace(reqID)
 	term = strings.TrimSpace(term)
-	enrID = strings.TrimSpace(enrID)
 	if studentID == "" || reqID == "" || enrID == "" {
 		return nil, "", errors.New("学生编号、要求编号和修读编号不能为空")
+	}
+	if strings.TrimSpace(enrID) == "" {
+		return nil, "", errors.New("修读编号不能只由空白字符组成")
 	}
 	if term == "" {
 		return nil, "", errors.New("学期不能为空")
