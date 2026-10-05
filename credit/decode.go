@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"unicode/utf8"
 )
 
 // duplicateFieldError 表示同一个 JSON 对象内出现了重复字段名。
@@ -114,4 +115,153 @@ func scanDuplicateKeys(r io.Reader) error {
 			}
 		}
 	}
+}
+
+// scanStringUnicode 按原始字节扫描第一份完整 JSON 值里的全部字符串
+// （字段名与字段值），验证每个字符串都能还原为合法 Unicode 文字：
+//   - 字符串中直接写入的字节必须是合法 UTF-8；
+//   - \uXXXX 转义中的高位代理项（U+D800–U+DBFF）必须紧跟一个低位代理项
+//     （U+DC00–U+DFFF）转义；孤立的低位代理项同样非法。
+//
+// 背景：encoding/json 解码时会把非法 UTF-8 字节与未配对的代理项转义静默
+// 替换成 U+FFFD（“�”）。替换后的学生编号、课程名称或免修依据绝不能被当成
+// 正常内容继续查询、核对或登记——两个本来不同的编号可能被替换成同一个
+// 而被误判重复或误判相同。因此必须在结构体解码之前按原始字节拒绝这样的
+// 文件，整份判为内容损坏，哪怕问题只在一条已拒绝免修的依据里、或在与本次
+// 核对无关的课程名称里。
+//
+// 合法文字不受影响：中文、直接写入的补充平面字符、完整的高低代理项转义对、
+// 用转义表达的控制字符都保留原意；用户确实写入的“�”（U+FFFD，直接写出
+// 或 \uFFFD 转义）也是合法文字，不能仅因解码结果含有它就拒绝文件。
+//
+// 与 scanDuplicateKeys 一样只扫描第一份完整值：完整记录之后的多余内容
+// 本来就会被读取方拒绝，无需在此重复判定。
+func scanStringUnicode(raw []byte) error {
+	i := 0
+	for i < len(raw) && isJSONSpace(raw[i]) {
+		i++
+	}
+	if i >= len(raw) {
+		return nil // 空输入交由后续结构体解码报错
+	}
+	switch raw[i] {
+	case '"':
+		// 顶层就是一个字符串：扫描它本身即可。
+		_, err := scanJSONString(raw, i)
+		return err
+	case '{', '[':
+	default:
+		return nil // 顶层标量（数字、true、false、null）不含字符串
+	}
+	depth := 0
+	for i < len(raw) {
+		switch raw[i] {
+		case '"':
+			j, err := scanJSONString(raw, i)
+			if err != nil {
+				return err
+			}
+			i = j
+		case '{', '[':
+			depth++
+			i++
+		case '}', ']':
+			depth--
+			i++
+			if depth == 0 {
+				// 唯一的顶层值已完整读完，其后内容不在本检查范围。
+				return nil
+			}
+		default:
+			i++
+		}
+	}
+	return nil // 未闭合的结构由 JSON 解析报错
+}
+
+// scanJSONString 扫描从 raw[start]（必须是 '"'）开始的一个字符串字面量，
+// 返回结束引号之后的下标。字符串内容无法还原为合法 Unicode 文字时报错；
+// 未闭合、非法转义形式等语法问题留给 JSON 解析器报告，本函数不为此报错。
+func scanJSONString(raw []byte, start int) (int, error) {
+	i := start + 1
+	for i < len(raw) {
+		c := raw[i]
+		switch {
+		case c == '"':
+			return i + 1, nil
+		case c == '\\':
+			if i+1 >= len(raw) {
+				return len(raw), nil
+			}
+			if raw[i+1] != 'u' {
+				i += 2 // 其他转义的合法性由 JSON 解析器校验
+				continue
+			}
+			v, ok := hex4(raw, i+2)
+			if !ok {
+				i += 2 // 非法 \u 转义形式由 JSON 解析器报错
+				continue
+			}
+			switch {
+			case isHighSurrogate(v):
+				// 高位代理项必须紧跟一个 \uXXXX 形式的低位代理项转义。
+				if i+12 <= len(raw) && raw[i+6] == '\\' && raw[i+7] == 'u' {
+					if v2, ok := hex4(raw, i+8); ok && isLowSurrogate(v2) {
+						i += 12
+						continue
+					}
+				}
+				return 0, fmt.Errorf(
+					`高位代理项转义 \u%04X 后没有紧跟低位代理项转义`, v)
+			case isLowSurrogate(v):
+				return 0, fmt.Errorf(
+					`低位代理项转义 \u%04X 没有对应的高位代理项转义`, v)
+			default:
+				i += 6
+			}
+		case c < utf8.RuneSelf:
+			i++
+		default:
+			// 直接写入的多字节字符必须是合法 UTF-8。注意 U+FFFD 本身
+			// 是合法文字：只有解码失败（size 为 1）才拒绝。
+			r, size := utf8.DecodeRune(raw[i:])
+			if r == utf8.RuneError && size == 1 {
+				return 0, fmt.Errorf(
+					"字符串中直接写入的字节 0x%02X 不是合法 UTF-8", c)
+			}
+			i += size
+		}
+	}
+	return i, nil // 未闭合的字符串由 JSON 解析器报错
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+func isHighSurrogate(r rune) bool { return 0xD800 <= r && r <= 0xDBFF }
+func isLowSurrogate(r rune) bool  { return 0xDC00 <= r && r <= 0xDFFF }
+
+// hex4 把 b[i:i+4] 读作四位十六进制数。
+func hex4(b []byte, i int) (rune, bool) {
+	if i+4 > len(b) {
+		return 0, false
+	}
+	var v rune
+	for k := 0; k < 4; k++ {
+		c := b[i+k]
+		var d byte
+		switch {
+		case '0' <= c && c <= '9':
+			d = c - '0'
+		case 'a' <= c && c <= 'f':
+			d = c - 'a' + 10
+		case 'A' <= c && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		v = v*16 + rune(d)
+	}
+	return v, true
 }
