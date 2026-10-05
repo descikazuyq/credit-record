@@ -406,9 +406,14 @@ func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollme
 // SubmitResult 为修读提交通过/未通过结果。
 // 重复提交相同结果返回原记录（幂等，不累加学分）；已提交结果后改提另一结果
 // 一律拒绝并保留原记录。
+//
+// 学生编号与修读编号按用户给出的完整文字参与匹配，前后空白（普通空格、
+// 制表符、全角空格等）也是编号内容，绝不修剪：记录文件可以合法保存
+// “s1”与“ s1 ”两名学生、同一学生名下“e1”与“ e1 ”两份修读，提交
+// 必须命中编号完全一致的那一份。完整编号找不到学生时报告学生不存在；
+// 学生存在但名下没有该完整修读编号时报告该修读不存在——即使去掉空白后
+// 能碰上另一名学生或另一份修读，也绝不借用那份记录，更不能据此补建修读。
 func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollment, changed bool, err error) {
-	studentID = strings.TrimSpace(studentID)
-	enrID = strings.TrimSpace(enrID)
 	if result != Passed && result != Failed {
 		return nil, false, fmt.Errorf("修读结果只能是 %s 或 %s", Passed, Failed)
 	}
