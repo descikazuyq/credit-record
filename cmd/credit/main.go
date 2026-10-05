@@ -331,6 +331,14 @@ func cmdCheck(s *credit.Store, args []string, out io.Writer) (int, error) {
 		// 没有记录的学生：明确的不存在结果，且不写任何数据。
 		return exitRejected, fmt.Errorf("%s", rep.String())
 	}
+	if rep.Overflow {
+		// 该学生实际获得的总学分超出学分整数类型可表示范围：按业务规则
+		// 拒绝本次核对（退出码 1），只在标准错误点名学生与溢出事实。
+		// 不能向标准输出写任何正常核对报告，也不能给出截断、回绕或部分
+		// 累加的总学分。各门课程学分本身合法，所以这不是文件损坏（退出码
+		// 不是 2）；核对只读，不保存、不改动任何记录，show 仍可查看原件。
+		return exitRejected, fmt.Errorf("%s", rep.OverflowMessage())
+	}
 	fmt.Fprint(out, rep.String())
 	return exitOK, nil
 }

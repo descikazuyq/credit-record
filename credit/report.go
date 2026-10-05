@@ -2,7 +2,9 @@ package credit
 
 import (
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 )
 
 // RequirementStatus 是核对时单项要求的判定结果。
@@ -33,7 +35,14 @@ type Report struct {
 	Found     bool // 学生是否存在
 	// TotalCredits 已满足要求获得的学分之和；同一课程的多项要求各计一次，
 	// 同一要求无论通过多少次或同时有免修都只计一份。
+	// 当 Overflow 为 true 时，真实总和超出学分整数类型可表示的最大值，
+	// TotalCredits 不再是可信结果，调用方必须拒绝展示本次核对。
 	TotalCredits int
+	// Overflow 表示该学生实际获得的总学分超出学分整数类型可表示的最大值。
+	// 这只与本学生已满足的要求有关：各门课程学分本身仍然合法，未满足要求、
+	// 选课或未通过的学分都不参与累计，其他学生的记录也不影响本判定，
+	// 因此绝不能把它当作记录文件损坏。
+	Overflow     bool
 	Requirements []RequirementStatus
 	// Unmet 是未满足的要求编号（保持 Requirements 中的顺序）。
 	Unmet []string
@@ -50,6 +59,16 @@ func (s *Store) CheckStudent(studentID string) Report {
 		return rep
 	}
 	rep.Found = true
+
+	// 每门课程学分为正整数，单项合法不代表总和仍落在学分整数类型范围内。
+	// 直接用 rep.TotalCredits += credit 累加会在超限时静默回绕（例如
+	// MaxInt + 1 变成负数），仍被当成成功的总学分输出。这里每次相加都
+	// 显式检查是否超出 MaxInt：一旦超出就只记录 Overflow，停止累加，
+	// 绝不用截断、回绕或“只加到某一项为止”的部分和充当结果。
+	// 是否超限只取决于该学生实际获得的学分：未满足的要求不计入，
+	// 其他学生的记录也完全不参与。
+	total := 0
+	overflow := false
 
 	// 汇总每项要求的通过修读（按结果提交先后）。
 	type seqEntry struct {
@@ -88,11 +107,26 @@ func (s *Store) CheckStudent(studentID string) Report {
 		}
 
 		if st.Satisfied && st.Course != nil {
-			rep.TotalCredits += st.Course.Credit
+			if !overflow {
+				credit := st.Course.Credit
+				if credit > math.MaxInt-total {
+					overflow = true
+				} else {
+					total += credit
+				}
+			}
 		} else {
 			rep.Unmet = append(rep.Unmet, r.ID)
 		}
 		rep.Requirements = append(rep.Requirements, st)
+	}
+
+	if overflow {
+		// 超限时不写出部分和：截断、回绕或“只累加到某一项”的数字都不能
+		// 作为总学分，TotalCredits 保持零值，仅以 Overflow 表明拒绝原因。
+		rep.Overflow = true
+	} else {
+		rep.TotalCredits = total
 	}
 
 	for _, w := range s.waivers {
@@ -108,6 +142,17 @@ func (s *Store) CheckStudent(studentID string) Report {
 		}
 	}
 	return rep
+}
+
+// OverflowMessage 返回总学分超出可表示范围时给用户的拒绝说明；未超限返回空串。
+// 说明只点名学生编号与溢出事实：各门课程学分本身均合法，这不是记录文件损坏。
+func (rep Report) OverflowMessage() string {
+	if !rep.Overflow {
+		return ""
+	}
+	return fmt.Sprintf(
+		"学生 %s 实际获得的总学分超出本程序学分整数类型可表示的最大值 %s，本次核对拒绝给出总学分",
+		rep.StudentID, strconv.Itoa(math.MaxInt))
 }
 
 // zhResult 将修读结果转为中文说明。
@@ -126,6 +171,12 @@ func zhResult(r Result) string {
 func (rep Report) String() string {
 	if !rep.Found {
 		return fmt.Sprintf("学生 %s 不存在，没有任何记录", rep.StudentID)
+	}
+	if rep.Overflow {
+		// 超限时不渲染正常核对报告：不能展示任何（必然是截断、回绕或部分
+		// 累加得到的）总学分，也不逐项展示带学分的核对结果。命令行核对
+		// 在打印前已据 Overflow 拒绝，这里返回同一拒绝说明作为兜底。
+		return rep.OverflowMessage()
 	}
 	var b []byte
 	b = append(b, fmt.Sprintf("学生 %s 核对结果\n", rep.StudentID)...)
