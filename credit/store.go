@@ -325,12 +325,24 @@ func (s *Store) SetCourseOpen(id string, open bool) (*Course, error) {
 // AddRequirement 为学生登记一项指向课程的要求。
 // 同一要求编号已存在且指向同一课程时返回原要求（幂等）；指向不同课程则拒绝。
 // 同一学生就同一课程已有要求（即使编号不同）也拒绝。学生或课程不存在时拒绝。
+//
+// 学生编号、要求编号与课程编号按用户给出的完整文字参与匹配，前后空白
+// （普通空格、制表符、全角空格等）也是编号内容，绝不修剪：记录文件可以
+// 合法保存 “s1” 与 “ s1 ” 两名学生、“c1” 与 “ c1 ” 两门课程、同一
+// 学生名下 “r1” 与 “ r1 ” 两项要求，登记必须命中编号完全一致的对象，
+// 新要求也必须登记在完整编号的学生名下、指向完整编号的课程并保留完整
+// 编号。完整编号找不到学生或课程时报告对应对象不存在——即使去掉空白能
+// 碰上另一名学生或另一门课程，也绝不借用那份记录，更不能自动创建学生或
+// 课程。重复登记与冲突判断同样按完整编号办理：“r1” 与 “ r1 ” 是两项
+// 不同的要求（仍须指向不同课程），同一学生不能换个要求编号为同一门课程
+// 再建要求。编号为空字符串时直接拒绝；只由空白字符组成的要求编号不得
+// 建立。
 func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requirement, action Action, err error) {
-	studentID = strings.TrimSpace(studentID)
-	reqID = strings.TrimSpace(reqID)
-	courseID = strings.TrimSpace(courseID)
-	if studentID == "" || reqID == "" {
-		return nil, "", errors.New("学生编号和要求编号不能为空")
+	if studentID == "" || reqID == "" || courseID == "" {
+		return nil, "", errors.New("学生编号、要求编号和课程编号不能为空")
+	}
+	if strings.TrimSpace(reqID) == "" {
+		return nil, "", errors.New("要求编号不能只由空白字符组成")
 	}
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, "", fmt.Errorf("学生 %s 不存在，不能登记课程要求", studentID)
