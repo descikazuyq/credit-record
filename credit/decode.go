@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"unicode/utf8"
 )
@@ -33,36 +34,83 @@ func (e *duplicateFieldError) Error() string {
 		e.first, e.second, e.field)
 }
 
-// objKind 标识一个 JSON 对象在记录格式中的位置，用于确定该对象有哪些
-// “能被现有读取功能识别”的字段名。
-type objKind int
-
-const (
-	objUnknown     objKind = iota // 不属于记录格式的对象（交由结构体解码按未知字段/类型拒绝）
-	objFile                       // 记录最外层 fileData
-	objCourse                     // courses 数组元素：课程
-	objStudent                    // students 数组元素：学生
-	objRequirement                // requirements 数组元素：课程要求
-	objEnrollment                 // enrollments 数组元素：修读
-	objWaiver                     // waivers 数组元素：免修
-)
-
-// recognizedFields 是各类对象能被读取功能识别的字段名（结构体 json 标签
-// 原文）。标签名必须与 fileData 及各记录结构体上的 json 标签保持一致。
-// 同一对象的标签在大小写不敏感比较下两两不同（否则该格式本身就有歧义）。
-var recognizedFields = map[objKind][]string{
-	objFile: {
-		"version", "courses", "students", "requirements",
-		"enrollments", "waivers", "nextResultSeq",
-	},
-	objCourse:      {"id", "name", "credit", "open"},
-	objStudent:     {"id"},
-	objRequirement: {"id", "student", "course"},
-	objEnrollment:  {"id", "student", "req", "term", "result", "resultSeq"},
-	objWaiver:      {"id", "student", "req", "basis", "status", "reason"},
+// recordSchema 描述一个 JSON 对象在记录格式中的字段识别口径：该对象有哪些
+// 能被现有读取功能识别的字段名（json 标签原文），以及其中每个“记录数组”
+// 字段的元素对象是哪种 schema（顶层 courses 的元素是课程，依此类推）。
+//
+// 正常读取（encoding/json 解进结构体）与读取前的字段归属检查只共用这一份
+// 描述：调整记录结构体的字段定义（增删字段、改动 json 标签、增删一类记录）
+// 时，能识别哪些写法、哪些写法指向同一字段的判断随之一起改变，不需要再
+// 同步修改另一份手写字段名称清单。
+type recordSchema struct {
+	// fields 是本对象能被读取功能识别的字段名（结构体 json 标签原文）。
+	// 同一对象的标签在大小写不敏感比较下两两不同（否则该格式本身就有歧义）。
+	fields []string
+	// arrays 以 json 标签原文为键，记录“记录数组”字段元素对象的 schema；
+	// 非数组字段（version 等标量）不在此表。
+	arrays map[string]*recordSchema
 }
 
-// matchRecordField 报告键名 key 是否会被现有读取功能填入 kind 对象的某个
+// fileSchema 是记录格式唯一的字段识别口径，直接从磁盘结构体定义推导：根为
+// fileData，沿其中的记录切片字段到达课程、学生、课程要求、修读、免修各结构
+// 体。识别字段名一律取结构体字段的 json 标签原文——与 encoding/json 正常
+// 解码所用的名称完全同源，不存在第二份需要同步维护的清单。推导只依赖类型
+// 定义、不依赖任何文件内容，包初始化期间一次性完成。
+var fileSchema = newRecordSchema(reflect.TypeOf(fileData{}))
+
+// newRecordSchema 从结构体类型 t 推导其 JSON 对象的字段识别口径：字段名取
+// 每个可导出字段 json 标签里的名称（",omitempty" 等选项剔除），名称为 "-"
+// 的字段不参与识别；元素类型也是结构体的切片字段登记为记录数组，其元素
+// schema 按同一方式递归推导。
+//
+// 只识别“结构体元素切片”这一种嵌套：记录格式只有最外层的五个数组承载
+// 记录对象，其它嵌套对象在格式中不存在，遇到时按未知对象交给结构体解码
+// 阶段拒绝。
+func newRecordSchema(t reflect.Type) *recordSchema {
+	sc := &recordSchema{arrays: map[string]*recordSchema{}}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // 不可导出字段不参与 JSON 解码
+		}
+		name, skip := jsonFieldName(f)
+		if skip {
+			continue // json:"-" 显式不参与
+		}
+		sc.fields = append(sc.fields, name)
+		if f.Type.Kind() == reflect.Slice {
+			e := f.Type.Elem()
+			if e.Kind() == reflect.Ptr {
+				e = e.Elem()
+			}
+			if e.Kind() == reflect.Struct {
+				sc.arrays[name] = newRecordSchema(e)
+			}
+		}
+	}
+	return sc
+}
+
+// jsonFieldName 取结构体字段在 JSON 中的名称，规则与 encoding/json 完全
+// 一致：标签缺失或名称为空（如 `json:",omitempty"`）时退化为 Go 字段名；
+// 名称为 "-" 且没有选项（`json:"-"`）表示该字段不参与（skip=true），而
+// `json:"-,"` 是一个名称恰为 "-" 的正常字段。
+func jsonFieldName(f reflect.StructField) (name string, skip bool) {
+	tag, ok := f.Tag.Lookup("json")
+	if !ok {
+		return f.Name, false
+	}
+	name, _, _ = strings.Cut(tag, ",")
+	if name == "-" && !strings.Contains(tag, ",") {
+		return "", true
+	}
+	if name == "" {
+		return f.Name, false
+	}
+	return name, false
+}
+
+// matchField 报告键名 key 是否会被现有读取功能填入该 schema 对象的某个
 // 记录字段，命中时返回该字段的规范名称（json 标签原文）。
 //
 // encoding/json 解进结构体时先按精确名匹配，不中再按大小写折叠名匹配，
@@ -70,8 +118,12 @@ var recognizedFields = map[objKind][]string{
 // 例如 U+212A“K”折到 k、U+0130“İ”折到 i）。这里照搬同一判定，才能保证
 // “两个键名被现有读取功能识别为同一字段”的口径与实际解码完全一致——
 // 任何大小写或 Unicode 转义组合都无法让一个键绕过本扫描却仍被解码器接受。
-func matchRecordField(kind objKind, key string) (string, bool) {
-	for _, tag := range recognizedFields[kind] {
+// 字段清单来自结构体定义本身（见 fileSchema），与正常解码同源。
+func (sc *recordSchema) matchField(key string) (string, bool) {
+	if sc == nil {
+		return "", false
+	}
+	for _, tag := range sc.fields {
 		if strings.EqualFold(key, tag) {
 			return tag, true
 		}
@@ -79,26 +131,20 @@ func matchRecordField(kind objKind, key string) (string, bool) {
 	return "", false
 }
 
-// fileKeyObjectKind 给出最外层对象某个键所对应数组元素/嵌套对象的类型。
-// 记录格式里只有最外层的五个数组承载记录对象。键名同样按“能否被读取功能
-// 识别”为准：大小写折叠后等于 courses 的键（如 COURSES）解出来仍是课程
-// 列表，其元素必须按课程对象检查，不能借顶层键的大小写写法绕过限制。
-func fileKeyObjectKind(key string) objKind {
-	if canonical, ok := matchRecordField(objFile, key); ok {
-		switch canonical {
-		case "courses":
-			return objCourse
-		case "students":
-			return objStudent
-		case "requirements":
-			return objRequirement
-		case "enrollments":
-			return objEnrollment
-		case "waivers":
-			return objWaiver
-		}
+// arrayElementSchema 给出本对象某个键所对应记录数组的元素 schema；该键不
+// 指向记录数组（不是可识别字段、或只是 version 之类标量）时返回 nil。
+// 键名按“能否被读取功能识别”为准：大小写折叠后等于 courses 的键（如
+// COURSES）解出来仍是课程列表，其元素必须按课程对象检查，不能借顶层键
+// 的大小写写法绕过限制。
+func (sc *recordSchema) arrayElementSchema(key string) *recordSchema {
+	if sc == nil {
+		return nil
 	}
-	return objUnknown
+	canonical, ok := sc.matchField(key)
+	if !ok {
+		return nil
+	}
+	return sc.arrays[canonical]
 }
 
 // scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
@@ -129,10 +175,11 @@ func fileKeyObjectKind(key string) objKind {
 func scanDuplicateKeys(r io.Reader) error {
 	type frame struct {
 		isObj bool
-		// kind 标识对象类型（决定有哪些可识别字段）；数组帧不用。
-		kind objKind
-		// elem 标识数组元素对象的类型（数组帧使用）。
-		elem objKind
+		// schema 标识对象能识别哪些字段（对象帧使用）；不属于记录格式的
+		// 对象为 nil，其键不参与大小写归并（完全同名仍按重复拒绝）。
+		schema *recordSchema
+		// elem 标识数组元素对象的 schema（数组帧使用）；非记录数组为 nil。
+		elem *recordSchema
 		// expectKey 仅对对象有意义：true 表示下一个字符串 token 是键
 		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。
 		// 对象内 token 天然按键、值、键、值交替（逗号不产生 token），
@@ -152,32 +199,31 @@ func scanDuplicateKeys(r io.Reader) error {
 	push := func(d json.Delim) {
 		switch d {
 		case '{':
-			kind := objUnknown
+			var sc *recordSchema
 			if n := len(stack); n == 0 {
 				// 第一份值的根对象即记录最外层；根值不是对象时结构体
 				// 解码阶段自会按类型拒绝。
-				kind = objFile
+				sc = fileSchema
 			} else if p := &stack[n-1]; p.isObj {
-				if p.kind == objFile {
-					kind = fileKeyObjectKind(p.pendingKey)
-				}
+				// 嵌套对象的字段口径由父对象当前键对应的记录数组给出；
+				// 该键不承载记录数组时为 nil（记录格式中不存在这种对象，
+				// 交由结构体解码按未知字段/类型拒绝）。
+				sc = p.schema.arrayElementSchema(p.pendingKey)
 			} else {
-				// 对象在数组里：类型由承载它的数组决定（数组类型又由
+				// 对象在数组里：字段口径由承载它的数组决定（数组口径又由
 				// 最外层五个字段之一决定）。
-				kind = stack[n-1].elem
+				sc = stack[n-1].elem
 			}
 			stack = append(stack, frame{
-				isObj: true, kind: kind, expectKey: true,
+				isObj: true, schema: sc, expectKey: true,
 				rawKeys: map[string]struct{}{},
 				seen:    map[string]string{},
 			})
 		case '[':
-			elem := objUnknown
+			var elem *recordSchema
 			if n := len(stack); n > 0 {
 				if p := &stack[n-1]; p.isObj {
-					if p.kind == objFile {
-						elem = fileKeyObjectKind(p.pendingKey)
-					}
+					elem = p.schema.arrayElementSchema(p.pendingKey)
 				} else {
 					// 数组嵌套：内层数组元素类型跟随外层数组。
 					elem = p.elem
@@ -236,7 +282,10 @@ func scanDuplicateKeys(r io.Reader) error {
 				// 只有指向同一条可识别记录字段的不同写法才算归属
 				// 冲突；未知键的大小写变体随后由结构体解码按未知字段
 				// 拒绝（如 "foo" 与 "Foo" 不会被当成任何业务字段）。
-				if canonical, known := matchRecordField(f.kind, t); known {
+				// 字段清单直接来自结构体定义（见 fileSchema），正常解码
+				// 与本检查对“能识别哪些写法”的口径始终一致；schema 为
+				// nil 的未知对象不参与归并（matchField 对 nil 返回 false）。
+				if canonical, known := f.schema.matchField(t); known {
 					if prev, conflict := f.seen[canonical]; conflict {
 						return &duplicateFieldError{
 							field:  canonical,
