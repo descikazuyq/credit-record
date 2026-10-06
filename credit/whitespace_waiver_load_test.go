@@ -411,7 +411,7 @@ func TestApplyWaiverWhitespaceEmptyIDsRejected(t *testing.T) {
 // 纯空白依据仍按业务规则拒绝并保留“免修依据为空”的原因；含实际文字时
 // 前后与中间空白随原文保留，再次提交必须逐字符一致才算内容相同。
 func TestApplyWaiverWhitespaceBasisRulesUnchanged(t *testing.T) {
-	// 带空白编号的学生只能来自记录文件（登记入口仍会修剪编号）。
+	// 带空白编号的学生可直接经登记入口建立，也可来自记录文件。
 	s, _ := mustLoadWhitespace(t, &fileData{
 		Version:      recordVersion,
 		Courses:      []*Course{{ID: "c2", Name: "线性代数", Credit: 3, Open: true}},

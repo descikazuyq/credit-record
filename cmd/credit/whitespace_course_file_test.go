@@ -88,8 +88,8 @@ func TestCLICourseWhitespaceNoBorrowWhenOnlyTrimmedExists(t *testing.T) {
 		Courses: []diskCourse{
 			{ID: "c1", Name: "高等数学", Credit: 4, Open: false},
 		},
-		// 带空白的学生编号直接写入文件（student 命令沿用修剪口径，这里
-		// 只验证 course 对带空白编号的处理）。
+		// 带空白的学生编号直接写入文件（本用例只验证 course 对带空白
+		// 编号的处理）。
 		Students: []diskStudent{{ID: " s1 "}, {ID: "s1"}},
 	}
 	file, _ := writeDiskRecord(t, d)
