@@ -231,9 +231,15 @@ func (s *Store) Waivers(student string) []*Waiver {
 // ---------- 学生 ----------
 
 // AddStudent 登记学生。编号已存在时原样返回已有学生且 action=existed（幂等）。
+//
+// 学生编号按用户给出的完整文字参与匹配与保存，前后空白（普通空格、制表符、
+// 全角空格、不换行空格等）也是编号内容，绝不修剪：记录文件可以合法保存 “s1”
+// 与 “ s1 ” 两名独立学生，登记与重复判断必须命中编号完全一致的那一名，并保留
+// 编号原文。完整编号找不到时一律新建，新学生不继承另一名学生（例如去掉空白后
+// 同号的学生）的课程要求、修读、免修或学分。编号为空字符串，或全部由空白字符
+// 组成（普通空格、制表符、全角空格、不换行空格等，允许混用）时直接拒绝。
 func (s *Store) AddStudent(id string) (st *Student, action Action, err error) {
-	id = strings.TrimSpace(id)
-	if id == "" {
+	if id == "" || strings.TrimSpace(id) == "" {
 		return nil, "", errors.New("学生编号不能为空")
 	}
 	if existing := s.studentByID[id]; existing != nil {
