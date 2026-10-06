@@ -4,52 +4,131 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"unicode/utf8"
 )
 
-// duplicateFieldError 表示同一个 JSON 对象内出现了重复字段名。
-type duplicateFieldError struct {
+// fieldConflictError 表示同一个 JSON 对象内出现了两个会被现有读取功能
+// 识别为同一个记录字段的字段名：既包括逐字相同的重复键，也包括仅大小写
+// 不同、但解码时会写入同一结构体字段的两个键（例如 "credit" 与 "Credit"）。
+type fieldConflictError struct {
+	// field 是参与冲突的字段名之一（按 JSON 解码后的实际文字报告）。
 	field string
 }
 
-func (e *duplicateFieldError) Error() string {
+func (e *fieldConflictError) Error() string {
 	return fmt.Sprintf("同一 JSON 对象内字段名 %q 重复出现，字段归属无法确定", e.field)
 }
 
-// scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
-// 字段名唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后是否
-// 还拼接了多余内容，那里的报错信息需要与本检查区分开）。
+// fieldKeysByObject 给出各类记录对象中“会被读取功能识别为同一记录字段”的
+// 字段名集合，统一取 JSON 字段名的小写形式（即 strings.ToLower(json tag)，
+// 因此 nextResultSeq 写作 nextresultseq）：
+//   - true 这一组是文件最外层对象（fileData）的字段；
+//   - false 这一组是数组内单条记录（课程/学生/要求/修读/免修）的字段合集。
 //
-// 背景：encoding/json 直接解进结构体（或 map）时，同一对象内的重复键会被
-// 后一个静默覆盖，读不出“曾经写过两个”，因此在正常结构体解码之前先单独
-// 扫描一遍 token 流。
+// 规则：在同一对象内，只要有两个字段名经 Unicode 反转义、并按
+// strings.ToLower 归并后落在同一个集合元素上，就算冲突——无论它们逐字
+// 是否相同、顺序与位置如何、两个值是否一致。这样 "credit" 与 "Credit"
+// 不能再让后一个值悄悄顶替前一个（学分 4 被换成 9、学生归属或免修状态被
+// 改写）。仅出现一次的大小写写法（例如只有 "Credit"）仍照常被标准库识别，
+// 单字段兼容性不变；不在任何集合内的键（未知字段）由后续的
+// DisallowUnknownFields 阶段拒绝，本扫描不据此做大小写归并。
+//
+// 各记录结构体的字段名彼此互不重叠（id/name/credit/open、student/course、
+// req/term/result/resultSeq、basis/status/reason 等），且冲突判定只限同一
+// 对象，因此把五类记录的字段合成一组不会把“不同对象里的不同字段”误判为
+// 同一字段——不同课程、不同学生等各自对象独立携带各自的字段，互不比较。
+var fieldKeysByObject = map[bool][]string{
+	// 最外层 fileData。
+	true: {
+		"version", "courses", "students", "requirements",
+		"enrollments", "waivers", "nextresultseq",
+	},
+	// 数组内的单条记录（课程/学生/要求/修读/免修）。这些字段名合在一个
+	// 集合里使用：只有同一个对象内同时出现两个键才会冲突，不同记录对象
+	// 各自携带同名字段互不比较；字段名集合互不重叠，因此把五类记录的键
+	// 合并不会把“不同字段”误判为同一字段。
+	false: {
+		// Course
+		"id", "name", "credit", "open",
+		// Student
+		// （id 已列）
+		// Requirement
+		"student", "course",
+		// Enrollment
+		"req", "term", "result", "resultseq",
+		// Waiver
+		"basis", "status", "reason",
+	},
+}
+
+// recognizedFieldKey 返回键名 key（JSON 解码后的实际文字）在给定对象类型
+// 所识别字段集合中的小写归并形式；该对象不识别此键时返回 ""（未知字段）。
+func recognizedFieldKey(isTop bool, key string) string {
+	lower := strings.ToLower(key)
+	for _, k := range fieldKeysByObject[isTop] {
+		if lower == k {
+			return k
+		}
+	}
+	return ""
+}
+
+// scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
+// 字段归属唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后
+// 是否还拼接了多余内容，那里的报错信息需要与本检查区分开）。
+//
+// 背景：encoding/json 直接解进结构体（或 map）时，同一对象内两个会映射到
+// 同一字段的键会被后一个静默覆盖，读不出“曾经写过两个”。逐字同名如此，
+// 仅大小写不同而指向同一结构体字段的两个键同样如此（例如课程同时写出
+// "credit":4 与 "Credit":9，先写谁就用谁）。因此在正常结构体解码之前先
+// 单独扫描一遍 token 流。
 //
 // 规则：
-//   - 同一个 JSON 对象内字段名只能出现一次；重复字段是否相邻、两个值是否
-//     相同都不影响判定，发现即返回 *duplicateFieldError（含字段名）。
+//   - 同一个 JSON 对象内，只要有两个字段名被现有读取功能识别为同一个记录
+//     字段，就返回 *fieldConflictError（含字段名），整份文件随后按内容
+//     损坏拒绝：逐字重复、仅大小写不同（credit/Credit、courses/COURSES、
+//     student/Student）都算；字段是否相邻、出现顺序、两个值是否相同都不
+//     影响判定。这一规则适用于最外层对象和数组中的每条课程、学生、要求、
+//     修读、免修记录。
 //   - 比较以 JSON 解码后的文字为准：Token() 返回的键名已完成 Unicode
-//     反转义，所以直接写出与 \uXXXX 转义形式的同名键仍算重复。
-//   - 限制只针对同一对象：对象与数组可任意嵌套，数组各元素、不同课程或
+//     反转义，所以直接写出与 \uXXXX 转义形式、以及“转义 + 大小写”的组合
+//     （"credit" 与 "Credit"）仍按解码后实际所指字段判断，无法借
+//     转义绕开；大小写归并用 strings.EqualFold 口径（strings.ToLower），
+//     与标准库结构体解码匹配字段名的方式一致。
+//   - 只出现一次的大小写写法不是冲突：仅有 "Credit" 的课程仍按该值读取。
+//     限制只针对同一对象：对象与数组可任意嵌套，数组各元素、不同课程或
 //     不同学生等不同对象各自携带同名字段是正常结构，互不比较。
 //   - 字符串“值”里出现字段名（依据、课程名称等）不是键，不参与检查。
+//     未知字段的大小写变体不在这里报错（交给后续 DisallowUnknownFields
+//     阶段拒绝），但同一对象内两个逐字相同的未知键仍按同名规则判损坏。
 func scanDuplicateKeys(r io.Reader) error {
 	type frame struct {
 		isObj bool
+		// isTop 仅对对象有意义：标记文件最外层对象。
+		isTop bool
 		// expectKey 仅对对象有意义：true 表示下一个字符串 token 是键
 		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。
 		// 对象内 token 天然按键、值、键、值交替（逗号不产生 token），
 		// 借此区分字符串 token 是键还是普通字符串值。
 		expectKey bool
-		keys      map[string]struct{}
+		// raw 逐字记录本对象内出现过的全部键名（JSON 解码后的实际文字），
+		// 用于保留“完全同名字段即损坏”的既有规则，未知字段也不例外。
+		raw map[string]struct{}
+		// seen 记录本对象内已经出现过的“识别字段归并名 -> 该字段首次
+		// 出现的实际键名”，用于把仅大小写不同、但会写入同一记录字段的
+		// 两个键判为冲突。未知字段不记录，交由结构体解码阶段处理。
+		seen map[string]string
 	}
 	var stack []frame
 	depth := 0
 
-	push := func(isObj bool) {
-		f := frame{isObj: isObj}
+	push := func(isObj, isTop bool) {
+		f := frame{isObj: isObj, isTop: isTop}
 		if isObj {
 			f.expectKey = true
-			f.keys = map[string]struct{}{}
+			f.raw = map[string]struct{}{}
+			f.seen = map[string]string{}
 		}
 		stack = append(stack, f)
 	}
@@ -78,10 +157,12 @@ func scanDuplicateKeys(r io.Reader) error {
 			switch t {
 			case '{':
 				depth++
-				push(true)
+				// 开在最外层（栈尚为空）的对象就是文件最外层对象；其余
+				// 对象都是某条记录或嵌套结构，按具体记录字段集合校验。
+				push(true, len(stack) == 0)
 			case '[':
 				depth++
-				push(false)
+				push(false, false)
 			case '}', ']':
 				depth--
 				stack = stack[:len(stack)-1]
@@ -95,12 +176,26 @@ func scanDuplicateKeys(r io.Reader) error {
 		case string:
 			n := len(stack)
 			if n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
-				// 对象键：Token() 已按解码后的文字返回。
-				if _, dup := stack[n-1].keys[t]; dup {
-					return &duplicateFieldError{field: t}
+				f := &stack[n-1]
+				// 对象键：Token() 已按解码后的文字返回。完全同名的键先按
+				// 既有规则判冲突——即使是读取功能不认识的未知字段，同一对象
+				// 内写两个逐字相同的键也无法说明归属，仍判损坏。
+				if _, dup := f.raw[t]; dup {
+					return &fieldConflictError{field: t}
 				}
-				stack[n-1].keys[t] = struct{}{}
-				stack[n-1].expectKey = false
+				f.raw[t] = struct{}{}
+				// 再确认它是该对象会识别的记录字段，并在同一对象内按大小
+				// 写归并判冲突：credit 与 Credit、courses 与 COURSES 等会
+				// 被解码为同一字段的两个键，同样不能让后者顶替前者。
+				if canon := recognizedFieldKey(f.isTop, t); canon != "" {
+					if first, dup := f.seen[canon]; dup {
+						// 报告先出现的那个实际字段名：无论第二个键写法
+						// （大小写/转义）如何，都能据此定位冲突字段。
+						return &fieldConflictError{field: first}
+					}
+					f.seen[canon] = t
+				}
+				f.expectKey = false
 				continue
 			}
 			valueEnded()

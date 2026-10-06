@@ -149,7 +149,148 @@ func TestCLIDuplicateFieldDoesNotLeakDataToOthers(t *testing.T) {
 	}
 }
 
-// TestCLISameFieldAcrossDifferentObjectsStillWorks 限制只针对同一对象：
+// TestCLICaseVariantFieldsRejectWholeFile 同一 JSON 对象内两个字段名仅大小
+// 写不同、却被识别为同一记录字段时（credit/Credit、student/Student、
+// courses/COURSES），必须沿用与完全同名字段一致的拒绝：退出码 2，标准错误
+// 点名记录文件、说明内容损坏并指出冲突字段名；标准输出不展示核对结果、记录
+// 内容或登记成功提示；不挑选其中一个值继续处理，原文件每个字节原样保留。
+// 即使冲突只在本次查询未涉及的记录（另一门课程、免修历史）里，也整份拒绝。
+func TestCLICaseVariantFieldsRejectWholeFile(t *testing.T) {
+	// 课程同时写 credit:4 与 Credit:9：绝不能按书写顺序取 4 或 9。
+	caseCredit := "{\n  \"version\": 1,\n  \"courses\": [\n" +
+		"    {\"id\": \"c1\", \"name\": \"数学\", \"credit\": 4, \"Credit\": 9," +
+		" \"open\": true}\n  ],\n" +
+		"  \"students\": [\n    {\"id\": \"s1\"}\n  ],\n" +
+		"  \"requirements\": [\n" +
+		"    {\"student\": \"s1\", \"id\": \"r1\", \"course\": \"c1\"}\n  ],\n" +
+		"  \"enrollments\": [\n" +
+		"    {\"student\": \"s1\", \"req\": \"r1\", \"term\": \"2024春\", \"id\": \"e1\"," +
+		" \"result\": \"enrolled\"}\n  ],\n" +
+		"  \"waivers\": [],\n  \"nextResultSeq\": 0\n}\n"
+
+	// 颠倒书写顺序（先 Credit 后 credit）：结论不能变，错误应指出冲突字段。
+	caseCreditReversed := "{\n  \"version\": 1,\n  \"courses\": [\n" +
+		"    {\"id\": \"c1\", \"name\": \"数学\", \"Credit\": 9, \"credit\": 4," +
+		" \"open\": true}\n  ],\n  \"students\": [],\n  \"requirements\": [],\n" +
+		"  \"enrollments\": [],\n  \"waivers\": [],\n  \"nextResultSeq\": 0\n}\n"
+
+	// 修读记录同时有 student 与 Student，不能据此改变所属学生。
+	caseStudent := "{\n  \"version\": 1,\n" +
+		"  \"students\": [{\"id\": \"s1\"}, {\"id\": \"s2\"}],\n" +
+		"  \"courses\": [{\"id\": \"c1\", \"name\": \"数学\", \"credit\": 4, \"open\": true}],\n" +
+		"  \"requirements\": [\n" +
+		"    {\"student\": \"s1\", \"id\": \"r1\", \"course\": \"c1\"}\n  ],\n" +
+		"  \"enrollments\": [\n" +
+		"    {\"id\": \"e1\", \"student\": \"s1\", \"Student\": \"s2\"," +
+		" \"req\": \"r1\", \"term\": \"2024春\", \"result\": \"enrolled\"}\n  ],\n" +
+		"  \"waivers\": [],\n  \"nextResultSeq\": 0\n}\n"
+
+	// 最外层 courses 与 COURSES，第二份即使是空数组也不能盖掉第一份。
+	caseTop := "{\n  \"version\": 1,\n" +
+		"  \"courses\": [{\"id\": \"c1\", \"name\": \"数学\", \"credit\": 4, \"open\": true}],\n" +
+		"  \"COURSES\": [],\n" +
+		"  \"students\": [{\"id\": \"s1\"}],\n" +
+		"  \"requirements\": [], \"enrollments\": [], \"waivers\": [],\n" +
+		"  \"nextResultSeq\": 0\n}\n"
+
+	// 冲突藏在本次核对完全不涉及的一门课程里：仍整份拒绝。
+	caseIrrelevant := "{\n  \"version\": 1,\n" +
+		"  \"courses\": [\n" +
+		"    {\"id\": \"c1\", \"name\": \"数学\", \"credit\": 4, \"open\": true},\n" +
+		"    {\"id\": \"c9\", \"name\": \"无关课程\", \"credit\": 3, \"CREDIT\": 3, \"open\": true}\n  ],\n" +
+		"  \"students\": [{\"id\": \"s1\"}],\n" +
+		"  \"requirements\": [{\"student\": \"s1\", \"id\": \"r1\", \"course\": \"c1\"}],\n" +
+		"  \"enrollments\": [],\n  \"waivers\": [],\n  \"nextResultSeq\": 0\n}\n"
+
+	// 用 Unicode 转义写出的大写键与小写直接键冲突：按解码后实际字段判断。
+	caseEscaped := "{\n  \"version\": 1,\n  \"courses\": [\n" +
+		"    {\"id\": \"c1\", \"name\": \"数学\", \"credit\": 4, \"\\u0043redit\": 9," +
+		" \"open\": true}\n  ],\n  \"students\": [],\n  \"requirements\": [],\n" +
+		"  \"enrollments\": [],\n  \"waivers\": [],\n  \"nextResultSeq\": 0\n}\n"
+
+	cases := map[string]struct {
+		content string
+		field   string
+	}{
+		"学分大小写冲突":     {caseCredit, "credit"},
+		"学分大小写冲突顺序颠倒": {caseCreditReversed, "Credit"},
+		"修读学生字段大小写冲突": {caseStudent, "student"},
+		"顶层数组字段大小写冲突": {caseTop, "courses"},
+		"冲突在无关课程中仍拒绝": {caseIrrelevant, "credit"},
+		"转义大写键与小写键冲突": {caseEscaped, "credit"},
+	}
+
+	commands := [][]string{
+		{"check", "s1"},
+		{"show", "s1"},
+		{"list-courses"},
+		{"student", "s9"},
+		{"course", "c9", "物理", "3"},
+		{"req", "s1", "r9", "c1"},
+		{"enroll", "s1", "r1", "2025春", "e9"},
+		{"pass", "s1", "e1"},
+		{"waiver", "s1", "r1", "w9", "新依据"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			for _, args := range commands {
+				file := filepath.Join(t.TempDir(), "records.json")
+				if err := os.WriteFile(file, []byte(tc.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				out, errText, code := runCLI(t, file, args...)
+				if code != exitFile {
+					t.Fatalf("命令 %v 遇大小写冲突字段应退出码 %d，code=%d out=%q err=%q",
+						args, exitFile, code, out, errText)
+				}
+				if out != "" {
+					t.Fatalf("命令 %v 不应输出任何核对结果或成功提示，out=%q", args, out)
+				}
+				if !strings.Contains(errText, "内容损坏") ||
+					!strings.Contains(errText, file) ||
+					!strings.Contains(errText, tc.field) {
+					t.Fatalf("命令 %v 的错误应说明内容损坏、点名文件并指出冲突字段 %q，err=%q",
+						args, tc.field, errText)
+				}
+				got, err := os.ReadFile(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != tc.content {
+					t.Fatalf("命令 %v 不得挑选值或改动原文件\nwant=%q\n got=%q",
+						args, tc.content, got)
+				}
+			}
+		})
+	}
+}
+
+// TestCLISingleCaseVariantFieldStillReads 兼容性：字段只出现一次时，大写
+// 写法仍能被识别读取（只有 Credit 的课程按该值读取），核对照常输出。
+func TestCLISingleCaseVariantFieldStillReads(t *testing.T) {
+	content := "{\n  \"version\": 1,\n" +
+		"  \"courses\": [{\"id\": \"c1\", \"name\": \"数学\", \"Credit\": 4, \"Open\": true}],\n" +
+		"  \"students\": [{\"id\": \"s1\"}],\n" +
+		"  \"requirements\": [{\"id\": \"r1\", \"Student\": \"s1\", \"Course\": \"c1\"}],\n" +
+		"  \"enrollments\": [\n" +
+		"    {\"id\": \"e1\", \"student\": \"s1\", \"req\": \"r1\", \"term\": \"2024春\",\n" +
+		"     \"result\": \"passed\", \"resultSeq\": 1}],\n" +
+		"  \"waivers\": [],\n  \"nextResultSeq\": 1\n}\n"
+	file := filepath.Join(t.TempDir(), "records.json")
+	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, errText, code := runCLI(t, file, "check", "s1")
+	if code != exitOK || !strings.Contains(out, "总学分：4") {
+		t.Fatalf("单个 Credit 大写字段应照常按 4 学分读取，code=%d out=%q err=%q",
+			code, out, errText)
+	}
+	if out, _, code := runCLI(t, file, "list-courses"); code != exitOK ||
+		!strings.Contains(out, "4 学分") || !strings.Contains(out, "开放") {
+		t.Fatalf("大写 Credit/Open 字段应照常列出，code=%d out=%q", code, out)
+	}
+}
+
 // 两名学生各自的同号要求、修读与免修保持现有归属规则；课程名称/免修依据
 // 文字里提到字段名也不得被误判为重复。
 func TestCLISameFieldAcrossDifferentObjectsStillWorks(t *testing.T) {
