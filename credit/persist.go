@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 )
 
 // recordVersion 是当前记录文件格式版本。
@@ -339,9 +340,117 @@ func (s *Store) loadData(d *fileData) error {
 	return nil
 }
 
+// invalidTextError 表示待保存的记录里存在无法按合法 UTF-8 原样写入文件的
+// 文字。Go 字符串可以携带任意字节，登记接口拿到的参数未必是合法 UTF-8；
+// 而 encoding/json 序列化时会把非法字节静默替换成 U+FFFD（“�”）。若带着
+// 这样的文字落盘，免修依据会被改写，两个本来不同的编号还可能被替换成同一
+// 个编号，使原本可读的记录文件变成编号重复的损坏文件。因此保存必须明确
+// 拒绝，绝不能用替换后的文字完成保存。
+type invalidTextError struct {
+	category string // 记录类别：课程/学生/课程要求/修读/免修
+	recordID string // 该条记录自身的编号
+	field    string // 出问题的字段（记录格式中的 JSON 字段名）
+	fieldZh  string // 字段中文名
+}
+
+func (e *invalidTextError) Error() string {
+	return fmt.Sprintf(
+		"%s %s 的字段 %q（%s）含无法原样保存的文字：不是合法 UTF-8，已拒绝整次保存，原记录未做任何修改",
+		e.category, e.recordID, e.field, e.fieldZh)
+}
+
+// textField 是一条待保存记录中需要校验的文字字段。
+type textField struct {
+	name string // 记录格式中的 JSON 字段名
+	zh   string // 字段中文名
+	v    string
+}
+
+// validateSaveText 遍历全部待保存记录的每个文字字段，确认都能按合法 UTF-8
+// 原样写入。编号、名称、学期、依据、原因以及结果、状态等枚举文字适用同一
+// 规则；即使问题只在一条已拒绝或已撤销免修的文字里，也返回错误拒绝整次
+// 保存——不删历史、不忽略字段、不只保存其他记录。校验只读不写：不修补、
+// 不清空、不替换任何字符串，内存中的待保存记录原样保留。
+//
+// 合法文字一律放行：中文、补充平面字符、用户确实输入的“�”（U+FFFD）都
+// 是合法 UTF-8；编号中的控制字符（如 U+0000、U+0001）与免修依据中原有
+// 的空白也照常保留。用户输入的字面文字“\uD800”只是反斜线加普通字母数字，
+// 是完全合法的文字，只有记录文件 JSON 里的 Unicode 转义才在读取阶段按
+// 代理项规则检查，二者不能混淆。
+func (s *Store) validateSaveText() error {
+	check := func(category, id string, fields []textField) error {
+		for _, f := range fields {
+			if !utf8.ValidString(f.v) {
+				return &invalidTextError{
+					category: category, recordID: id, field: f.name, fieldZh: f.zh}
+			}
+		}
+		return nil
+	}
+	for _, c := range s.courses {
+		if err := check("课程", c.ID, []textField{
+			{"id", "编号", c.ID},
+			{"name", "名称", c.Name},
+		}); err != nil {
+			return err
+		}
+	}
+	for _, st := range s.students {
+		if err := check("学生", st.ID, []textField{
+			{"id", "编号", st.ID},
+		}); err != nil {
+			return err
+		}
+	}
+	for _, r := range s.requirements {
+		if err := check("课程要求", r.ID, []textField{
+			{"id", "要求编号", r.ID},
+			{"student", "学生编号", r.StudentID},
+			{"course", "课程编号", r.CourseID},
+		}); err != nil {
+			return err
+		}
+	}
+	for _, e := range s.enrollments {
+		if err := check("修读", e.ID, []textField{
+			{"id", "修读编号", e.ID},
+			{"student", "学生编号", e.StudentID},
+			{"req", "要求编号", e.ReqID},
+			{"term", "学期", e.Term},
+			{"result", "结果", string(e.Result)},
+		}); err != nil {
+			return err
+		}
+	}
+	for _, w := range s.waivers {
+		if err := check("免修", w.ID, []textField{
+			{"id", "免修编号", w.ID},
+			{"student", "学生编号", w.StudentID},
+			{"req", "要求编号", w.ReqID},
+			{"basis", "依据", w.Basis},
+			{"status", "状态", string(w.Status)},
+			{"reason", "原因", w.Reason},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Save 将全部记录原子写入 path：先写同目录临时文件，再重命名覆盖，
 // 避免写到一半时损坏原文件。
+//
+// 落盘前先校验全部待保存文字都是合法 UTF-8：任何一条课程、学生、课程要求、
+// 修读或免修记录的任何文字字段（编号、名称、学期、依据、原因等）含有非法
+// 字节时，明确返回错误拒绝整次保存。encoding/json 会把非法字节静默替换成
+// “�”，绝不能用替换后的文字落盘——那会改掉依据原文，或把不同编号写成同
+// 一个编号。校验发生在序列化与创建临时文件之前，因此目标文件原本不存在时
+// 不会留下任何新文件，已存在的记录文件逐字节保留，待保存记录中的原始字符
+// 串也不被修补、清空或替换。
 func (s *Store) Save(path string) (err error) {
+	if err := s.validateSaveText(); err != nil {
+		return err
+	}
 	data := fileData{
 		Version:       recordVersion,
 		Courses:       s.courses,
