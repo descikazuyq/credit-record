@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"unicode/utf8"
 )
@@ -47,19 +48,70 @@ const (
 	objWaiver                     // waivers 数组元素：免修
 )
 
-// recognizedFields 是各类对象能被读取功能识别的字段名（结构体 json 标签
-// 原文）。标签名必须与 fileData 及各记录结构体上的 json 标签保持一致。
-// 同一对象的标签在大小写不敏感比较下两两不同（否则该格式本身就有歧义）。
-var recognizedFields = map[objKind][]string{
-	objFile: {
-		"version", "courses", "students", "requirements",
-		"enrollments", "waivers", "nextResultSeq",
-	},
-	objCourse:      {"id", "name", "credit", "open"},
-	objStudent:     {"id"},
-	objRequirement: {"id", "student", "course"},
-	objEnrollment:  {"id", "student", "req", "term", "result", "resultSeq"},
-	objWaiver:      {"id", "student", "req", "basis", "status", "reason"},
+// recordObjectTypes 把每类对象对应到它在记录格式中的结构体类型。各类对象
+// “能被读取功能识别哪些字段名”只有结构体定义上的 json 标签这一个出处：
+// 正常读取时 json.Decoder 按这些标签（先精确名、再大小写折叠名）填入字段，
+// 重复字段扫描也从同一份结构体定义取字段名。调整一项记录的字段（增删、
+// 改名、换标签）只需改结构体定义，正常读取与重复检查始终对“哪些字段可
+// 识别、哪些写法指向同一字段”作出一致判断，不需要再同步另一份字段名称
+// 清单。
+var recordObjectTypes = map[objKind]reflect.Type{
+	objFile:        reflect.TypeOf(fileData{}),
+	objCourse:      reflect.TypeOf(Course{}),
+	objStudent:     reflect.TypeOf(Student{}),
+	objRequirement: reflect.TypeOf(Requirement{}),
+	objEnrollment:  reflect.TypeOf(Enrollment{}),
+	objWaiver:      reflect.TypeOf(Waiver{}),
+}
+
+// jsonFieldName 按 encoding/json 的规则给出结构体字段被识别的 JSON 名称：
+// 未导出字段不参与解码；json 标签为 "-" 的字段跳过（返回空串）；没有标签
+// 时用 Go 字段名本身；omitempty 等选项不影响名称。记录结构体均为扁平字段，
+// 无嵌入字段提升问题。
+func jsonFieldName(sf reflect.StructField) string {
+	if sf.PkgPath != "" {
+		return ""
+	}
+	name := sf.Tag.Get("json")
+	if name == "-" {
+		return ""
+	}
+	if comma := strings.IndexByte(name, ','); comma >= 0 {
+		name = name[:comma]
+	}
+	if name == "" {
+		name = sf.Name
+	}
+	return name
+}
+
+// recordFields 是各类对象能被读取功能识别的字段名（结构体 json 标签原文），
+// 全部直接取自 recordObjectTypes 中的结构体定义，不在别处另列一份。
+// 同一对象的字段名在大小写不敏感比较下必须两两不同——否则该格式本身就有
+// 歧义（两个字段折叠到同一名称），在初始化阶段直接指出这类定义错误。
+var recordFields = buildRecordFields()
+
+func buildRecordFields() map[objKind][]string {
+	m := make(map[objKind][]string, len(recordObjectTypes))
+	for kind, t := range recordObjectTypes {
+		names := make([]string, 0, t.NumField())
+		for i := 0; i < t.NumField(); i++ {
+			name := jsonFieldName(t.Field(i))
+			if name == "" {
+				continue
+			}
+			for _, other := range names {
+				if strings.EqualFold(name, other) {
+					panic(fmt.Sprintf(
+						"记录结构体 %s 的字段 %q 与 %q 在大小写折叠后同名，记录格式存在歧义",
+						t.Name(), name, other))
+				}
+			}
+			names = append(names, name)
+		}
+		m[kind] = names
+	}
+	return m
 }
 
 // matchRecordField 报告键名 key 是否会被现有读取功能填入 kind 对象的某个
@@ -67,11 +119,12 @@ var recognizedFields = map[objKind][]string{
 //
 // encoding/json 解进结构体时先按精确名匹配，不中再按大小写折叠名匹配，
 // 折叠规则等同于 strings.EqualFold（完整 Unicode 简单折叠，而非仅 ASCII：
-// 例如 U+212A“K”折到 k、U+0130“İ”折到 i）。这里照搬同一判定，才能保证
-// “两个键名被现有读取功能识别为同一字段”的口径与实际解码完全一致——
-// 任何大小写或 Unicode 转义组合都无法让一个键绕过本扫描却仍被解码器接受。
+// 例如 U+212A“K”折到 k、U+0130“İ”折到 i）。这里照搬同一判定，字段名又
+// 直接来自结构体标签，才能保证“两个键名被现有读取功能识别为同一字段”的
+// 口径与实际解码完全一致——任何大小写或 Unicode 转义组合都无法让一个键
+// 绕过本扫描却仍被解码器接受。
 func matchRecordField(kind objKind, key string) (string, bool) {
-	for _, tag := range recognizedFields[kind] {
+	for _, tag := range recordFields[kind] {
 		if strings.EqualFold(key, tag) {
 			return tag, true
 		}
@@ -80,23 +133,32 @@ func matchRecordField(kind objKind, key string) (string, bool) {
 }
 
 // fileKeyObjectKind 给出最外层对象某个键所对应数组元素/嵌套对象的类型。
-// 记录格式里只有最外层的五个数组承载记录对象。键名同样按“能否被读取功能
-// 识别”为准：大小写折叠后等于 courses 的键（如 COURSES）解出来仍是课程
-// 列表，其元素必须按课程对象检查，不能借顶层键的大小写写法绕过限制。
+// 记录格式里只有最外层的五个数组承载记录对象。归属同样直接由 fileData 的
+// 结构体定义推导：键按大小写折叠命中哪个字段，就取该字段（切片取元素、
+// 指针解引用）的类型再反查对象类型——courses 与 COURSES 解出来都是课程
+// 列表，其元素必须按课程对象检查，不能借顶层键的大小写写法绕过限制；
+// version 等非记录对象字段返回 objUnknown。
 func fileKeyObjectKind(key string) objKind {
-	if canonical, ok := matchRecordField(objFile, key); ok {
-		switch canonical {
-		case "courses":
-			return objCourse
-		case "students":
-			return objStudent
-		case "requirements":
-			return objRequirement
-		case "enrollments":
-			return objEnrollment
-		case "waivers":
-			return objWaiver
+	t := recordObjectTypes[objFile]
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		name := jsonFieldName(sf)
+		if name == "" || !strings.EqualFold(name, key) {
+			continue
 		}
+		ft := sf.Type
+		if ft.Kind() == reflect.Slice {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Ptr {
+			ft = ft.Elem()
+		}
+		for kind, rt := range recordObjectTypes {
+			if rt == ft {
+				return kind
+			}
+		}
+		return objUnknown
 	}
 	return objUnknown
 }
