@@ -49,6 +49,20 @@ type fileData struct {
 // 的大小写写法仍照常识别（如只有 Credit 的课程按该值读取）；不指向任何
 // 记录字段的未知键不在此列，继续按未知字段拒绝。
 //
+// 课程开放状态字段被显式写成 JSON null（"open": null）时，整份文件同样按
+// 内容损坏拒绝：课程的开放状态是非指针 bool，标准库会把 null 静默读成
+// false，未定状态会被当成明确停开——课程列表显示停开、新增修读因此被拒，
+// 之后任何需要保存的操作还会把 false 写回文件。因此只要课程对象显式给出
+// 指向 open 的字段（open、Open、OPEN 及解码后等同的 \uXXXX 转义写法，字段
+// 位置不限）而值为 null，就拒绝读取整份文件并点名课程编号；即使这门课尚未
+// 被要求引用、或本次查看的是另一名学生，也不能跳过该课程继续办理。true
+// （开放）与 false（停开）仍是合法状态，false 课程仍可被要求引用、其停开
+// 前已有修读仍可提交成绩；字段省略时沿用既有读取规则，不因本次修正改变。
+// 课程名称、免修依据等字符串值里的普通文字“null”不是开放状态；最外层表示
+// 没有记录的 null 列表或空数组（如 "courses": null）照常按空列表读取。
+// 检查只读不写：不补填状态、不删除课程、不另存部分记录，原文件全部字节保持
+// 不变。
+//
 // JSON 字符串的原始内容必须能还原为合法 Unicode 文字：字符串中直接写入的
 // 字节不是合法 UTF-8，或 \uXXXX 转义中出现未配对的高位/低位代理项（高位
 // 代理项后没有紧跟低位代理项、孤立的低位代理项、两个高位代理项相连等），
@@ -100,25 +114,40 @@ func Load(path string) (s *Store, existed bool, err error) {
 			path, err)
 	}
 
-	// 先在 token 流上检查同一 JSON 对象内的字段归属。标准库直接解进结构
-	// 体时会用后一个重复键静默覆盖前一个，而且结构体字段按大小写不敏感
-	// 匹配 json 标签：同一门课程写了 "credit":4 与 "Credit":9（4 会被
-	// 9 悄悄顶替，两个键颠倒又变成 4），最外层同时写 courses 与 COURSES
-	// （后一份即使是空数组也会盖掉前一份），修读里的 student 与 Student
-	// 都无法明确说明字段归属。这样的记录必须整份判为损坏，绝不能据此
-	// 核对或办理——即使冲突只在本次查询没有涉及的课程或免修历史里。
-	// 仅扫描第一份完整值，其后内容仍由下方的“完整记录之后不得有多余
-	// 内容”检查处理。
+	// 先扫描第一份完整值的 token 流，拦截两类结构性损坏，再做结构体解码：
+	//
+	// 1) 同一 JSON 对象内的字段归属必须唯一。标准库直接解进结构体时会用后
+	//    一个重复键静默覆盖前一个，而且结构体字段按大小写不敏感匹配 json
+	//    标签：同一门课程写了 "credit":4 与 "Credit":9（4 会被 9 悄悄顶替，
+	//    两个键颠倒又变成 4），最外层同时写 courses 与 COURSES（后一份即使
+	//    是空数组也会盖掉前一份），修读里的 student 与 Student 都无法明确
+	//    说明字段归属。
+	// 2) 课程对象显式给出开放状态字段却把值写成 JSON null（"open": null）。
+	//    非指针 bool 会把 null 静默读成 false：未定状态被当成明确停开，课程
+	//    列表显示停开、新增修读因此被拒，下次保存还会把 false 落盘。
+	//
+	// 两类问题都必须把整份记录判为损坏，绝不能据此核对或办理——即使冲突或
+	// 空值只在本次查询没有涉及的课程里、该课程尚未被要求引用、或本次办理的
+	// 是另一名学生，也不能跳过该课程继续。扫描中的 JSON 语法错误不在此报告，
+	// 原样留给随后的结构体解码给出权威解析错误；第一份完整值之后的内容则由
+	// 更下方的“完整记录之后不得有多余内容”检查处理。
 	var dupErr *duplicateFieldError
-	if err := scanDuplicateKeys(bytes.NewReader(raw)); errors.As(err, &dupErr) {
-		if dupErr.first == dupErr.second {
+	var nullOpenErr *nullCourseOpenError
+	if err := scanDuplicateKeys(bytes.NewReader(raw)); err != nil {
+		switch {
+		case errors.As(err, &dupErr):
+			if dupErr.first == dupErr.second {
+				return nil, true, fmt.Errorf(
+					"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 重复出现，字段归属无法确定），未做任何修改",
+					path, dupErr.field)
+			}
 			return nil, true, fmt.Errorf(
-				"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 重复出现，字段归属无法确定），未做任何修改",
-				path, dupErr.field)
+				"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 与 %q 仅大小写不同，读取时都指向同一记录字段 %q，字段归属无法确定），未做任何修改",
+				path, dupErr.first, dupErr.second, dupErr.field)
+		case errors.As(err, &nullOpenErr):
+			return nil, true, fmt.Errorf(
+				"记录文件 %s 内容损坏（%v），未做任何修改", path, nullOpenErr)
 		}
-		return nil, true, fmt.Errorf(
-			"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 与 %q 仅大小写不同，读取时都指向同一记录字段 %q，字段归属无法确定），未做任何修改",
-			path, dupErr.first, dupErr.second, dupErr.field)
 	}
 
 	var data fileData

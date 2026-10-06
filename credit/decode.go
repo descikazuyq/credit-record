@@ -34,6 +34,27 @@ func (e *duplicateFieldError) Error() string {
 		e.first, e.second, e.field)
 }
 
+// nullCourseOpenError 表示课程对象显式提供了开放状态字段，却把值写成 JSON
+// 的 null（"open": null）。encoding/json 把 null 解进非指针 bool 字段时会
+// 静默保留零值 false：未定状态会被读成明确的“停开”，课程列表显示停开、
+// 新增修读因此被拒，之后任何需要保存的操作还会把 false 落盘，让没有确定
+// 状态的数据变成明确的停开记录。这不是合法状态，按课程记录内容损坏处理。
+// courseID 是该课程对象中 id 字段解码后的编号原文（id 出现在 open 前后均
+// 可，扫描在课程对象结束时才报错以取得编号）；课程同时缺少编号时为空串。
+type nullCourseOpenError struct {
+	courseID string
+}
+
+func (e *nullCourseOpenError) Error() string {
+	if e.courseID == "" {
+		return "存在开放状态为空的课程（该课程同时缺少编号）：open 字段被显式写成 null，" +
+			"开放状态只能是 true（开放）或 false（停开）"
+	}
+	return fmt.Sprintf(
+		"课程 %s 的开放状态为空：open 字段被显式写成 null，开放状态只能是 true（开放）或 false（停开）",
+		e.courseID)
+}
+
 // objKind 标识一个 JSON 对象在记录格式中的位置，用于确定该对象有哪些
 // “能被现有读取功能识别”的字段名。
 type objKind int
@@ -164,14 +185,23 @@ func fileKeyObjectKind(key string) objKind {
 }
 
 // scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
-// 字段归属唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后
-// 是否还拼接了多余内容，那里的报错信息需要与本检查区分开）。
+// 字段归属唯一，同时检查课程开放状态字段不被显式写成 null；第一份值之后的
+// 字节一律不读（调用方另行检查完整记录之后是否还拼接了多余内容，那里的报错
+// 信息需要与本检查区分开）。
 //
-// 背景：encoding/json 直接解进结构体（或 map）时，同一对象内的重复键会被
-// 后一个静默覆盖，而且结构体字段按大小写折叠匹配 json 标签（规则等同于
+// 背景一（字段归属）：encoding/json 直接解进结构体（或 map）时，同一对象
+// 内的重复键会被后一个静默覆盖，而且结构体字段按大小写折叠匹配 json 标签（规则等同于
 // strings.EqualFold）——同一门课程同时写 "credit":4 与 "Credit":9 时，
 // 标准库读不出“曾经写过两个”，学分直接被后一个值顶替，两个键先后颠倒
 // 结果也随之颠倒。因此在正常结构体解码之前先单独扫描一遍 token 流。
+//
+// 背景二（课程开放状态）：课程的开放状态字段是非指针 bool，encoding/json
+// 遇到显式 null（"open": null）时不会报错，而是静默保留零值 false——没有
+// 确定的状态会被读成明确的“停开”：课程列表显示停开、新增修读因此被拒，
+// 之后任何需要保存的操作还会把 false 写回文件，让未定状态变成明确的停开
+// 记录。因此课程对象一旦显式给出指向 open 的字段而值为 null，就在本扫描
+// 中按内容损坏拒绝整份文件，哪怕这门课尚未被要求引用、或本次办理的是另一
+// 名学生，也不能跳过该课程继续办理。
 //
 // 规则：
 //   - 同一个 JSON 对象内字段归属只能确定一次：完全同名的两个键，或两个
@@ -182,7 +212,16 @@ func fileKeyObjectKind(key string) objKind {
 //   - 比较以 JSON 解码后的文字为准：Token() 返回的键名已完成 Unicode
 //     反转义，所以 "credit"、它的 \uXXXX 转义写法与 "Credit" 之间任意
 //     两两组合都按解码后实际所指的字段判断，不能用转义加大小写的组合
-//     绕开限制。
+//     绕开限制。open/Open/OPEN 及其 \uXXXX 转义写法同理：解码后等同于
+//     这些名字的键都指向课程开放状态，课程对象中对应值为 null 时返回
+//     *nullCourseOpenError；true 与 false 是合法状态，省略 open 字段不
+//     在此列（沿用既有读取规则）。
+//   - 开放状态检查只认课程对象（objCourse）内指向 open 的字段：课程名称、
+//     免修依据等字符串值里的普通文字“null”不是字段值；其他对象中无法
+//     识别的 open 写法留给随后的未知字段解码阶段处理。字段在课程对象中
+//     的位置不影响结果：open 出现在 id 之前时，错误延迟到该课程对象结束
+//     再报告，以便点名课程编号。最外层表示“没有记录”的 null 列表或空
+//     数组（如 "courses": null）不是课程对象，不参与本检查。
 //   - 限制只针对同一对象：对象与数组可任意嵌套，数组各元素、不同课程或
 //     不同学生等不同对象各自携带同名字段是正常结构，互不比较。
 //   - 不能被读取功能识别的字段不参与折叠归并，但完全同名仍按重复拒绝；
@@ -202,11 +241,20 @@ func scanDuplicateKeys(r io.Reader) error {
 		expectKey bool
 		// pendingKey 是当前值所属的键，用于判断嵌套对象/数组的类型。
 		pendingKey string
+		// pendingCanonical 是当前值所属键对应的规范记录字段名（不指向任何
+		// 可识别记录字段时为空），用于识别课程 open 字段的显式 null 值。
+		pendingCanonical string
 		// rawKeys 记录该对象内出现过的全部原始键名（解码后文字）。
 		rawKeys map[string]struct{}
 		// seen 记录每条可识别记录字段第一次出现时的原始写法，以规范
 		// 字段名为索引；无法识别的键不进此表。
 		seen map[string]string
+		// nullOpen 标记课程对象已出现“显式 open 字段值为 null”。发现时不
+		// 立即报错，延迟到对象结束，以便用课程编号点名。
+		nullOpen bool
+		// courseID 是课程对象中 id 字段解码后的编号原文，供 open 出现在 id
+		// 之前时的错误信息点名课程；缺少编号则保持空串。
+		courseID string
 	}
 	var stack []frame
 	depth := 0
@@ -255,6 +303,7 @@ func scanDuplicateKeys(r io.Reader) error {
 			if f.isObj && !f.expectKey {
 				f.expectKey = true
 				f.pendingKey = ""
+				f.pendingCanonical = ""
 			}
 		}
 	}
@@ -277,6 +326,11 @@ func scanDuplicateKeys(r io.Reader) error {
 				push(t)
 			case '}', ']':
 				depth--
+				// 课程对象结束时若发现过显式 "open": null，在这里统一报错：
+				// 此时无论 id 写在 open 之前还是之后，编号都已读到。
+				if closed := stack[len(stack)-1]; closed.isObj && closed.nullOpen {
+					return &nullCourseOpenError{courseID: closed.courseID}
+				}
 				stack = stack[:len(stack)-1]
 				if depth == 0 {
 					// 唯一的顶层值已完整读完，其后内容不在本检查范围。
@@ -298,26 +352,52 @@ func scanDuplicateKeys(r io.Reader) error {
 				// 只有指向同一条可识别记录字段的不同写法才算归属
 				// 冲突；未知键的大小写变体随后由结构体解码按未知字段
 				// 拒绝（如 "foo" 与 "Foo" 不会被当成任何业务字段）。
-				if canonical, known := matchRecordField(f.kind, t); known {
-					if prev, conflict := f.seen[canonical]; conflict {
+				canonical := ""
+				if c, known := matchRecordField(f.kind, t); known {
+					if prev, conflict := f.seen[c]; conflict {
 						return &duplicateFieldError{
-							field:  canonical,
+							field:  c,
 							first:  prev,
 							second: t,
 						}
 					}
-					f.seen[canonical] = t
+					f.seen[c] = t
+					canonical = c
 				}
 				f.expectKey = false
 				f.pendingKey = t
+				f.pendingCanonical = canonical
 				continue
+			}
+			// 字符串值：在课程对象内记下 id 字段的编号原文。open 写在 id
+			// 之前时，对象结束处的报错仍能用编号点名；id 缺失则保持空串。
+			if n > 0 {
+				if f := &stack[n-1]; f.isObj && f.kind == objCourse &&
+					f.pendingCanonical == "id" {
+					f.courseID = t
+				}
 			}
 			valueEnded()
 			if depth == 0 {
 				return nil // 顶层标量值
 			}
+		case nil:
+			// 显式 JSON null 标量。只有课程对象的开放状态字段取 null 才是
+			// 记录损坏：非指针 bool 会把 null 静默读成零值 false，未定状态
+			// 会被当成明确停开。其他字段的 null（含最外层 null 列表）不在
+			// 此判定，继续交给结构体解码按原规则处理。
+			if n := len(stack); n > 0 {
+				if f := &stack[n-1]; f.isObj && f.kind == objCourse &&
+					f.pendingCanonical == "open" {
+					f.nullOpen = true
+				}
+			}
+			valueEnded()
+			if depth == 0 {
+				return nil
+			}
 		default:
-			// number、bool、nil 等标量值。
+			// number、bool 等其他标量值；true/false 是开放状态的合法取值。
 			valueEnded()
 			if depth == 0 {
 				return nil
