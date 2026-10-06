@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 )
 
 // recordVersion 是当前记录文件格式版本。
@@ -339,9 +340,137 @@ func (s *Store) loadData(d *fileData) error {
 	return nil
 }
 
+// invalidTextError 表示待保存记录中含有无法原样写入文件的文字：某个字符串
+// 字段不是合法 UTF-8。category 指出记录类别（课程、学生、课程要求、修读、
+// 免修），id 是该条记录的编号（仅用于定位，编号本身也可能就是问题所在，
+// 按原始字节呈现），field 指出具体字段。
+type invalidTextError struct {
+	category string
+	id       string
+	field    string
+}
+
+func (e *invalidTextError) Error() string {
+	return fmt.Sprintf(
+		"%s记录（编号 %s）的字段“%s”含无法原样保存的非法 UTF-8 文字",
+		e.category, e.id, e.field)
+}
+
+// validateSaveText 检查全部待写入记录的字符串字段是否都是合法 UTF-8。
+//
+// 背景：encoding/json 在序列化时会把字符串里的非法 UTF-8 字节静默替换成
+// U+FFFD（“�”）却照常返回成功。若直接保存，免修依据会被改写，两个本来
+// 不同的学生编号还可能被替换成同一个编号，让原本可读的记录文件变成编号
+// 重复的损坏文件，而命令却提示成功。因此凡是要写入文件的文字——课程、
+// 学生、课程要求、修读、免修的编号、名称、学期、依据、原因等——都必须先
+// 通过本检查，任何一个字段不合法就拒绝整次保存。
+//
+// 检查只读不补：绝不替换、清空或修补任何原始字符串，也不删除出问题的
+// 那条历史（即使它只是一条已拒绝或已撤销的免修），更不会跳过该字段只存
+// 其他记录。合法文字不受影响：中文、补充平面字符、用户确实输入的“�”
+// （U+FFFD）都是合法 UTF-8；编号中合法的控制字符与免修依据中原有的空白
+// 也原样保留。命令行里字面出现的“\uD800”只是反斜线加普通字母数字，是
+// 合法 ASCII 文字，不按记录文件中的 Unicode 转义处理。
+func (s *Store) validateSaveText() error {
+	for _, c := range s.courses {
+		if c == nil {
+			continue
+		}
+		if err := checkSaveText("课程", c.ID, "编号", c.ID); err != nil {
+			return err
+		}
+		if err := checkSaveText("课程", c.ID, "名称", c.Name); err != nil {
+			return err
+		}
+	}
+	for _, st := range s.students {
+		if st == nil {
+			continue
+		}
+		if err := checkSaveText("学生", st.ID, "编号", st.ID); err != nil {
+			return err
+		}
+	}
+	for _, r := range s.requirements {
+		if r == nil {
+			continue
+		}
+		if err := checkSaveText("课程要求", r.ID, "编号", r.ID); err != nil {
+			return err
+		}
+		if err := checkSaveText("课程要求", r.ID, "学生编号", r.StudentID); err != nil {
+			return err
+		}
+		if err := checkSaveText("课程要求", r.ID, "课程编号", r.CourseID); err != nil {
+			return err
+		}
+	}
+	for _, e := range s.enrollments {
+		if e == nil {
+			continue
+		}
+		if err := checkSaveText("修读", e.ID, "编号", e.ID); err != nil {
+			return err
+		}
+		if err := checkSaveText("修读", e.ID, "学生编号", e.StudentID); err != nil {
+			return err
+		}
+		if err := checkSaveText("修读", e.ID, "要求编号", e.ReqID); err != nil {
+			return err
+		}
+		if err := checkSaveText("修读", e.ID, "学期", e.Term); err != nil {
+			return err
+		}
+		if err := checkSaveText("修读", e.ID, "结果", string(e.Result)); err != nil {
+			return err
+		}
+	}
+	for _, w := range s.waivers {
+		if w == nil {
+			continue
+		}
+		if err := checkSaveText("免修", w.ID, "编号", w.ID); err != nil {
+			return err
+		}
+		if err := checkSaveText("免修", w.ID, "学生编号", w.StudentID); err != nil {
+			return err
+		}
+		if err := checkSaveText("免修", w.ID, "要求编号", w.ReqID); err != nil {
+			return err
+		}
+		if err := checkSaveText("免修", w.ID, "依据", w.Basis); err != nil {
+			return err
+		}
+		if err := checkSaveText("免修", w.ID, "状态", string(w.Status)); err != nil {
+			return err
+		}
+		if err := checkSaveText("免修", w.ID, "原因", w.Reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkSaveText 校验单个待保存字段的文字是否为合法 UTF-8。
+func checkSaveText(category, id, field, value string) error {
+	if !utf8.ValidString(value) {
+		return &invalidTextError{category: category, id: id, field: field}
+	}
+	return nil
+}
+
 // Save 将全部记录原子写入 path：先写同目录临时文件，再重命名覆盖，
 // 避免写到一半时损坏原文件。
+//
+// 写入前先校验全部待保存字符串都是合法 UTF-8：标准库序列化会把非法字节
+// 静默替换成 U+FFFD，因此含非法文字的数据绝不能进入序列化与临时文件阶段。
+// 校验失败时整次保存直接返回错误——不创建/不改动目标文件（目标原本不
+// 存在时也不会留下新记录文件或临时文件），不替换、清空或修补待保存记录
+// 中的任何原始字符串，即使问题只出现在一条已拒绝或已撤销免修的字段里。
 func (s *Store) Save(path string) (err error) {
+	if err := s.validateSaveText(); err != nil {
+		return fmt.Errorf("记录中存在无法原样保存的文字，拒绝写入 %s：%w", path, err)
+	}
 	data := fileData{
 		Version:       recordVersion,
 		Courses:       s.courses,
