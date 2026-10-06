@@ -145,6 +145,17 @@ func (s *Store) resetIndexes() {
 	s.waiverByKey = map[ownerKey]*Waiver{}
 }
 
+// ensureIndexes 在首次写入前惰性建立索引，使 Store 零值即可用：直接声明的
+// 零值记录集合（索引均为 nil）在第一次登记时自动补齐索引，行为与
+// NewStore 创建的空集合一致，调用者无需额外初始化。索引只会整体建立或
+// 整体为 nil，因此检查其中一个即可。只读查询本就可以安全读取 nil 索引，
+// 无需调用本函数。
+func (s *Store) ensureIndexes() {
+	if s.courseByID == nil {
+		s.resetIndexes()
+	}
+}
+
 // NewStore 返回空记录集。
 func NewStore() *Store { return newStore() }
 
@@ -246,6 +257,7 @@ func (s *Store) Waivers(student string) []*Waiver {
 // 保存。这与登记课程要求、选课、提交成绩、免修、核对、查询使用的对象
 // 完全一致。
 func (s *Store) AddStudent(id string) (st *Student, action Action, err error) {
+	s.ensureIndexes()
 	if id == "" {
 		return nil, "", errors.New("学生编号不能为空")
 	}
@@ -293,6 +305,7 @@ const (
 // 允许混用）时直接拒绝；含实际文字的编号原样保存。课程名称沿用现有输入
 // 规则：前后空白不计入名称内容，修剪后为空则拒绝。
 func (s *Store) AddCourse(id, name string, credit int) (c *Course, action Action, err error) {
+	s.ensureIndexes()
 	name = strings.TrimSpace(name)
 	if id == "" {
 		return nil, "", errors.New("课程编号不能为空")
@@ -369,6 +382,7 @@ func (s *Store) SetCourseOpen(id string, open bool) (*Course, error) {
 // 课程是否停开不影响建立要求：新要求本身不带来学分，之后只有通过修读
 // 或有效免修才能满足它。
 func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requirement, action Action, err error) {
+	s.ensureIndexes()
 	if studentID == "" || reqID == "" || courseID == "" {
 		return nil, "", errors.New("学生编号、要求编号和课程编号不能为空")
 	}
@@ -420,6 +434,7 @@ func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requiremen
 // 只由空白字符组成的修读编号不得建立。学期沿用现有输入规则：前后空白
 // 不计入学期内容，修剪后为空则拒绝。
 func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollment, action Action, err error) {
+	s.ensureIndexes()
 	term = strings.TrimSpace(term)
 	if studentID == "" || reqID == "" || enrID == "" {
 		return nil, "", errors.New("学生编号、要求编号和修读编号不能为空")
@@ -539,6 +554,7 @@ func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollm
 // 原样保留；是否“没有依据”只按空白内容判定（见 blankBasis），绝不修剪
 // 或改写依据原文。
 func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver, action Action, err error) {
+	s.ensureIndexes()
 	if studentID == "" || reqID == "" || waiverID == "" {
 		return nil, "", errors.New("学生编号、要求编号和免修编号不能为空")
 	}
