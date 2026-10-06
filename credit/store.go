@@ -132,11 +132,20 @@ func blankBasis(basis string) bool {
 
 func newStore() *Store {
 	s := &Store{}
-	s.resetIndexes()
+	s.ensureIndexes()
 	return s
 }
 
-func (s *Store) resetIndexes() {
+// ensureIndexes 惰性建立索引，保证 Store 文档约定的“零值即可用”：
+// 用 var s credit.Store 直接声明出的零值集合与 NewStore 返回的空集合
+// 行为一致，第一次登记学生或课程都能正常完成，调用者不需要另行初始化。
+// 六个索引总是一起建立，因此只需检查其中一个是否为 nil。所有读写索引
+// 的方法都先经过这里：已初始化的集合（含 NewStore 与 Load 得到的集合）
+// 只多一次 nil 判断，已有记录、结果序号与免修历史都不受影响。
+func (s *Store) ensureIndexes() {
+	if s.courseByID != nil {
+		return
+	}
 	s.courseByID = map[string]*Course{}
 	s.studentByID = map[string]*Student{}
 	s.reqByKey = map[ownerKey]*Requirement{}
@@ -155,24 +164,32 @@ func (s *Store) Dirty() bool { return s.dirty }
 // ---------- 查询 ----------
 
 // Course 按编号返回课程；不存在返回 nil。
-func (s *Store) Course(id string) *Course { return s.courseByID[id] }
+func (s *Store) Course(id string) *Course {
+	s.ensureIndexes()
+	return s.courseByID[id]
+}
 
 // Courses 按登记顺序返回全部课程。
 func (s *Store) Courses() []*Course { return append([]*Course(nil), s.courses...) }
 
 // Student 按编号返回学生；不存在返回 nil。
-func (s *Store) Student(id string) *Student { return s.studentByID[id] }
+func (s *Store) Student(id string) *Student {
+	s.ensureIndexes()
+	return s.studentByID[id]
+}
 
 // Students 按登记顺序返回全部学生。
 func (s *Store) Students() []*Student { return append([]*Student(nil), s.students...) }
 
 // Requirement 返回某学生名下的要求；不存在（包括要求属于其他学生）返回 nil。
 func (s *Store) Requirement(student, reqID string) *Requirement {
+	s.ensureIndexes()
 	return s.reqByKey[reqKey(student, reqID)]
 }
 
 // Requirements 返回某学生的全部要求（按登记顺序）；学生不存在返回 nil。
 func (s *Store) Requirements(student string) []*Requirement {
+	s.ensureIndexes()
 	if _, ok := s.studentByID[student]; !ok {
 		return nil
 	}
@@ -192,11 +209,13 @@ func (s *Store) AllRequirements() []*Requirement {
 
 // Enrollment 返回某学生名下的修读；不存在返回 nil。
 func (s *Store) Enrollment(student, id string) *Enrollment {
+	s.ensureIndexes()
 	return s.enrByKey[reqKey(student, id)]
 }
 
 // Enrollments 返回某学生的全部修读（按登记顺序）；学生不存在返回 nil。
 func (s *Store) Enrollments(student string) []*Enrollment {
+	s.ensureIndexes()
 	if _, ok := s.studentByID[student]; !ok {
 		return nil
 	}
@@ -211,11 +230,13 @@ func (s *Store) Enrollments(student string) []*Enrollment {
 
 // Waiver 返回某学生名下的免修申请；不存在返回 nil。
 func (s *Store) Waiver(student, id string) *Waiver {
+	s.ensureIndexes()
 	return s.waiverByKey[reqKey(student, id)]
 }
 
 // Waivers 返回某学生的全部免修历史（按申请顺序）；学生不存在返回 nil。
 func (s *Store) Waivers(student string) []*Waiver {
+	s.ensureIndexes()
 	if _, ok := s.studentByID[student]; !ok {
 		return nil
 	}
@@ -246,6 +267,7 @@ func (s *Store) Waivers(student string) []*Waiver {
 // 保存。这与登记课程要求、选课、提交成绩、免修、核对、查询使用的对象
 // 完全一致。
 func (s *Store) AddStudent(id string) (st *Student, action Action, err error) {
+	s.ensureIndexes()
 	if id == "" {
 		return nil, "", errors.New("学生编号不能为空")
 	}
@@ -293,6 +315,7 @@ const (
 // 允许混用）时直接拒绝；含实际文字的编号原样保存。课程名称沿用现有输入
 // 规则：前后空白不计入名称内容，修剪后为空则拒绝。
 func (s *Store) AddCourse(id, name string, credit int) (c *Course, action Action, err error) {
+	s.ensureIndexes()
 	name = strings.TrimSpace(name)
 	if id == "" {
 		return nil, "", errors.New("课程编号不能为空")
@@ -339,6 +362,7 @@ func (s *Store) courseReferenced(id string) bool {
 
 // SetCourseOpen 设置课程开放状态。课程不存在时报错；状态相同则原样返回。
 func (s *Store) SetCourseOpen(id string, open bool) (*Course, error) {
+	s.ensureIndexes()
 	c := s.courseByID[id]
 	if c == nil {
 		return nil, fmt.Errorf("课程 %s 不存在", id)
@@ -369,6 +393,7 @@ func (s *Store) SetCourseOpen(id string, open bool) (*Course, error) {
 // 课程是否停开不影响建立要求：新要求本身不带来学分，之后只有通过修读
 // 或有效免修才能满足它。
 func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requirement, action Action, err error) {
+	s.ensureIndexes()
 	if studentID == "" || reqID == "" || courseID == "" {
 		return nil, "", errors.New("学生编号、要求编号和课程编号不能为空")
 	}
@@ -420,6 +445,7 @@ func (s *Store) AddRequirement(studentID, reqID, courseID string) (r *Requiremen
 // 只由空白字符组成的修读编号不得建立。学期沿用现有输入规则：前后空白
 // 不计入学期内容，修剪后为空则拒绝。
 func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollment, action Action, err error) {
+	s.ensureIndexes()
 	term = strings.TrimSpace(term)
 	if studentID == "" || reqID == "" || enrID == "" {
 		return nil, "", errors.New("学生编号、要求编号和修读编号不能为空")
@@ -482,6 +508,7 @@ func (s *Store) AddEnrollment(studentID, reqID, term, enrID string) (e *Enrollme
 // 学生存在但名下没有该完整修读编号时报告该修读不存在——即使去掉空白后
 // 能碰上另一名学生或另一份修读，也绝不借用那份记录，更不能据此补建修读。
 func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollment, changed bool, err error) {
+	s.ensureIndexes()
 	if result != Passed && result != Failed {
 		return nil, false, fmt.Errorf("修读结果只能是 %s 或 %s", Passed, Failed)
 	}
@@ -539,6 +566,7 @@ func (s *Store) SubmitResult(studentID, enrID string, result Result) (e *Enrollm
 // 原样保留；是否“没有依据”只按空白内容判定（见 blankBasis），绝不修剪
 // 或改写依据原文。
 func (s *Store) ApplyWaiver(studentID, reqID, waiverID, basis string) (w *Waiver, action Action, err error) {
+	s.ensureIndexes()
 	if studentID == "" || reqID == "" || waiverID == "" {
 		return nil, "", errors.New("学生编号、要求编号和免修编号不能为空")
 	}
@@ -598,6 +626,7 @@ func (s *Store) validWaiver(studentID, reqID string) *Waiver {
 // 能碰上另一名学生或另一份免修，也绝不借用那份记录，更不能改写原编号、
 // 合并申请或新增免修历史。撤销提示与免修历史一律使用实际命中的原编号。
 func (s *Store) RevokeWaiver(studentID, waiverID, reason string) (w *Waiver, changed bool, err error) {
+	s.ensureIndexes()
 	reason = strings.TrimSpace(reason)
 	if _, ok := s.studentByID[studentID]; !ok {
 		return nil, false, fmt.Errorf("学生 %s 不存在", studentID)

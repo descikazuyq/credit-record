@@ -54,6 +54,7 @@ type Report struct {
 
 // CheckStudent 按学生核对学分。查询没有记录的学生时 Found=false。
 func (s *Store) CheckStudent(studentID string) Report {
+	s.ensureIndexes()
 	rep := Report{StudentID: studentID}
 	if _, ok := s.studentByID[studentID]; !ok {
 		return rep
