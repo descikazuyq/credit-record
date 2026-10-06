@@ -4,54 +4,187 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"unicode/utf8"
 )
 
-// duplicateFieldError 表示同一个 JSON 对象内出现了重复字段名。
+// duplicateFieldError 表示同一个 JSON 对象内出现了读取功能无法确定归属的
+// 两个字段：
+//   - 字段名完全相同（first == second，如两份 "credit"）；
+//   - 两个字段名只有大小写差异（编码/json 的大小写折叠等同于
+//     strings.EqualFold），却都被现有读取功能识别为同一条记录字段
+//     （如 "credit" 与 "Credit" 都填入课程学分，"courses" 与
+//     "COURSES" 都填入最外层课程列表）。
+//
+// field 是两者共同指向的规范字段名（结构体 json 标签原文）；完全同名时
+// 与 first、second 相同。
 type duplicateFieldError struct {
-	field string
+	field  string
+	first  string
+	second string
 }
 
 func (e *duplicateFieldError) Error() string {
-	return fmt.Sprintf("同一 JSON 对象内字段名 %q 重复出现，字段归属无法确定", e.field)
+	if e.first == e.second {
+		return fmt.Sprintf("同一 JSON 对象内字段名 %q 重复出现，字段归属无法确定", e.first)
+	}
+	return fmt.Sprintf(
+		"同一 JSON 对象内字段名 %q 与 %q 仅大小写不同，读取时都指向同一记录字段 %q，字段归属无法确定",
+		e.first, e.second, e.field)
+}
+
+// objKind 标识一个 JSON 对象在记录格式中的位置，用于确定该对象有哪些
+// “能被现有读取功能识别”的字段名。
+type objKind int
+
+const (
+	objUnknown     objKind = iota // 不属于记录格式的对象（交由结构体解码按未知字段/类型拒绝）
+	objFile                       // 记录最外层 fileData
+	objCourse                     // courses 数组元素：课程
+	objStudent                    // students 数组元素：学生
+	objRequirement                // requirements 数组元素：课程要求
+	objEnrollment                 // enrollments 数组元素：修读
+	objWaiver                     // waivers 数组元素：免修
+)
+
+// recognizedFields 是各类对象能被读取功能识别的字段名（结构体 json 标签
+// 原文）。标签名必须与 fileData 及各记录结构体上的 json 标签保持一致。
+// 同一对象的标签在大小写不敏感比较下两两不同（否则该格式本身就有歧义）。
+var recognizedFields = map[objKind][]string{
+	objFile: {
+		"version", "courses", "students", "requirements",
+		"enrollments", "waivers", "nextResultSeq",
+	},
+	objCourse:      {"id", "name", "credit", "open"},
+	objStudent:     {"id"},
+	objRequirement: {"id", "student", "course"},
+	objEnrollment:  {"id", "student", "req", "term", "result", "resultSeq"},
+	objWaiver:      {"id", "student", "req", "basis", "status", "reason"},
+}
+
+// matchRecordField 报告键名 key 是否会被现有读取功能填入 kind 对象的某个
+// 记录字段，命中时返回该字段的规范名称（json 标签原文）。
+//
+// encoding/json 解进结构体时先按精确名匹配，不中再按大小写折叠名匹配，
+// 折叠规则等同于 strings.EqualFold（完整 Unicode 简单折叠，而非仅 ASCII：
+// 例如 U+212A“K”折到 k、U+0130“İ”折到 i）。这里照搬同一判定，才能保证
+// “两个键名被现有读取功能识别为同一字段”的口径与实际解码完全一致——
+// 任何大小写或 Unicode 转义组合都无法让一个键绕过本扫描却仍被解码器接受。
+func matchRecordField(kind objKind, key string) (string, bool) {
+	for _, tag := range recognizedFields[kind] {
+		if strings.EqualFold(key, tag) {
+			return tag, true
+		}
+	}
+	return "", false
+}
+
+// fileKeyObjectKind 给出最外层对象某个键所对应数组元素/嵌套对象的类型。
+// 记录格式里只有最外层的五个数组承载记录对象。键名同样按“能否被读取功能
+// 识别”为准：大小写折叠后等于 courses 的键（如 COURSES）解出来仍是课程
+// 列表，其元素必须按课程对象检查，不能借顶层键的大小写写法绕过限制。
+func fileKeyObjectKind(key string) objKind {
+	if canonical, ok := matchRecordField(objFile, key); ok {
+		switch canonical {
+		case "courses":
+			return objCourse
+		case "students":
+			return objStudent
+		case "requirements":
+			return objRequirement
+		case "enrollments":
+			return objEnrollment
+		case "waivers":
+			return objWaiver
+		}
+	}
+	return objUnknown
 }
 
 // scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
-// 字段名唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后是否
-// 还拼接了多余内容，那里的报错信息需要与本检查区分开）。
+// 字段归属唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后
+// 是否还拼接了多余内容，那里的报错信息需要与本检查区分开）。
 //
 // 背景：encoding/json 直接解进结构体（或 map）时，同一对象内的重复键会被
-// 后一个静默覆盖，读不出“曾经写过两个”，因此在正常结构体解码之前先单独
-// 扫描一遍 token 流。
+// 后一个静默覆盖，而且结构体字段按大小写折叠匹配 json 标签（规则等同于
+// strings.EqualFold）——同一门课程同时写 "credit":4 与 "Credit":9 时，
+// 标准库读不出“曾经写过两个”，学分直接被后一个值顶替，两个键先后颠倒
+// 结果也随之颠倒。因此在正常结构体解码之前先单独扫描一遍 token 流。
 //
 // 规则：
-//   - 同一个 JSON 对象内字段名只能出现一次；重复字段是否相邻、两个值是否
-//     相同都不影响判定，发现即返回 *duplicateFieldError（含字段名）。
+//   - 同一个 JSON 对象内字段归属只能确定一次：完全同名的两个键，或两个
+//     键名在大小写折叠后都指向同一条可识别记录字段（如 credit 与
+//     Credit、student 与 Student、courses 与 COURSES），发现即返回
+//     *duplicateFieldError（含规范字段名与两个原始写法）。
+//   - 字段顺序、是否相邻、两个值是否相同都不影响判定。
 //   - 比较以 JSON 解码后的文字为准：Token() 返回的键名已完成 Unicode
-//     反转义，所以直接写出与 \uXXXX 转义形式的同名键仍算重复。
+//     反转义，所以 "credit"、它的 \uXXXX 转义写法与 "Credit" 之间任意
+//     两两组合都按解码后实际所指的字段判断，不能用转义加大小写的组合
+//     绕开限制。
 //   - 限制只针对同一对象：对象与数组可任意嵌套，数组各元素、不同课程或
 //     不同学生等不同对象各自携带同名字段是正常结构，互不比较。
+//   - 不能被读取功能识别的字段不参与折叠归并，但完全同名仍按重复拒绝；
+//     真正的未知字段留给随后的 DisallowUnknownFields 解码阶段拒绝。
 //   - 字符串“值”里出现字段名（依据、课程名称等）不是键，不参与检查。
 func scanDuplicateKeys(r io.Reader) error {
 	type frame struct {
 		isObj bool
+		// kind 标识对象类型（决定有哪些可识别字段）；数组帧不用。
+		kind objKind
+		// elem 标识数组元素对象的类型（数组帧使用）。
+		elem objKind
 		// expectKey 仅对对象有意义：true 表示下一个字符串 token 是键
 		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。
 		// 对象内 token 天然按键、值、键、值交替（逗号不产生 token），
 		// 借此区分字符串 token 是键还是普通字符串值。
 		expectKey bool
-		keys      map[string]struct{}
+		// pendingKey 是当前值所属的键，用于判断嵌套对象/数组的类型。
+		pendingKey string
+		// rawKeys 记录该对象内出现过的全部原始键名（解码后文字）。
+		rawKeys map[string]struct{}
+		// seen 记录每条可识别记录字段第一次出现时的原始写法，以规范
+		// 字段名为索引；无法识别的键不进此表。
+		seen map[string]string
 	}
 	var stack []frame
 	depth := 0
 
-	push := func(isObj bool) {
-		f := frame{isObj: isObj}
-		if isObj {
-			f.expectKey = true
-			f.keys = map[string]struct{}{}
+	push := func(d json.Delim) {
+		switch d {
+		case '{':
+			kind := objUnknown
+			if n := len(stack); n == 0 {
+				// 第一份值的根对象即记录最外层；根值不是对象时结构体
+				// 解码阶段自会按类型拒绝。
+				kind = objFile
+			} else if p := &stack[n-1]; p.isObj {
+				if p.kind == objFile {
+					kind = fileKeyObjectKind(p.pendingKey)
+				}
+			} else {
+				// 对象在数组里：类型由承载它的数组决定（数组类型又由
+				// 最外层五个字段之一决定）。
+				kind = stack[n-1].elem
+			}
+			stack = append(stack, frame{
+				isObj: true, kind: kind, expectKey: true,
+				rawKeys: map[string]struct{}{},
+				seen:    map[string]string{},
+			})
+		case '[':
+			elem := objUnknown
+			if n := len(stack); n > 0 {
+				if p := &stack[n-1]; p.isObj {
+					if p.kind == objFile {
+						elem = fileKeyObjectKind(p.pendingKey)
+					}
+				} else {
+					// 数组嵌套：内层数组元素类型跟随外层数组。
+					elem = p.elem
+				}
+			}
+			stack = append(stack, frame{isObj: false, elem: elem})
 		}
-		stack = append(stack, f)
 	}
 	// valueEnded 通知栈顶对象：刚读完一个值（标量或嵌套结构的结束括号）。
 	valueEnded := func() {
@@ -59,6 +192,7 @@ func scanDuplicateKeys(r io.Reader) error {
 			f := &stack[n-1]
 			if f.isObj && !f.expectKey {
 				f.expectKey = true
+				f.pendingKey = ""
 			}
 		}
 	}
@@ -76,12 +210,9 @@ func scanDuplicateKeys(r io.Reader) error {
 		switch t := tok.(type) {
 		case json.Delim:
 			switch t {
-			case '{':
+			case '{', '[':
 				depth++
-				push(true)
-			case '[':
-				depth++
-				push(false)
+				push(t)
 			case '}', ']':
 				depth--
 				stack = stack[:len(stack)-1]
@@ -95,12 +226,28 @@ func scanDuplicateKeys(r io.Reader) error {
 		case string:
 			n := len(stack)
 			if n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
-				// 对象键：Token() 已按解码后的文字返回。
-				if _, dup := stack[n-1].keys[t]; dup {
-					return &duplicateFieldError{field: t}
+				f := &stack[n-1]
+				// 对象键：Token() 已按解码后的文字返回，\uXXXX 转义
+				// 形式的键名与直接写出的同名键在这里完全不可区分。
+				if _, dup := f.rawKeys[t]; dup {
+					return &duplicateFieldError{field: t, first: t, second: t}
 				}
-				stack[n-1].keys[t] = struct{}{}
-				stack[n-1].expectKey = false
+				f.rawKeys[t] = struct{}{}
+				// 只有指向同一条可识别记录字段的不同写法才算归属
+				// 冲突；未知键的大小写变体随后由结构体解码按未知字段
+				// 拒绝（如 "foo" 与 "Foo" 不会被当成任何业务字段）。
+				if canonical, known := matchRecordField(f.kind, t); known {
+					if prev, conflict := f.seen[canonical]; conflict {
+						return &duplicateFieldError{
+							field:  canonical,
+							first:  prev,
+							second: t,
+						}
+					}
+					f.seen[canonical] = t
+				}
+				f.expectKey = false
+				f.pendingKey = t
 				continue
 			}
 			valueEnded()
