@@ -65,6 +65,18 @@ type fileData struct {
 // 按内容损坏拒绝读取，即使该要求另有通过修读也不例外。已拒绝申请的依据允许
 // 为空或只有空白。检查只读不写：不会补填依据、不会改动免修状态，也不会修剪
 // 含实际文字的依据中原有空白。
+//
+// 课程开放状态字段显式写成 JSON null（"open":null，open、Open、OPEN 及解码
+// 后等同的 Unicode 转义写法都指向同一字段，字段在课程对象中的位置不影响
+// 结果）时，整份记录按内容损坏拒绝读取。标准库把 null 解进普通 bool 不报错，
+// 字段保持零值 false，未定状态会被读成明确停开，进而误拒新增修读，并在后续
+// 保存时把 null 固化成 false；因此只要课程编号、名称、学分合法而开放状态
+// 显式为空，就拒绝整份文件——该课程尚未被要求引用、本次只查看另一名学生
+// 也不跳过它继续办理。true（开放）与 false（停开）仍是合法状态，停开课程
+// 照常可以建立要求、已有修读照常提交成绩；字段完全省略时沿用既有读取规则，
+// 本次不改动。课程名称、免修依据中的普通文字“null”（字符串值）不是状态空值；
+// 最外层 null、空数组或空列表继续按各自既有规则读取。检查只读不写：不补填
+// 状态、不删除课程、不另存部分记录。
 func Load(path string) (s *Store, existed bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -119,6 +131,21 @@ func Load(path string) (s *Store, existed bool, err error) {
 		return nil, true, fmt.Errorf(
 			"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 与 %q 仅大小写不同，读取时都指向同一记录字段 %q，字段归属无法确定），未做任何修改",
 			path, dupErr.first, dupErr.second, dupErr.field)
+	}
+
+	// 显式的 "open":null 必须在结构体解码之前拦截。标准库把 JSON null 解进
+	// 非指针 bool 时既不报错也不改字段，零值 false 会被原样保留——于是“开放
+	// 状态未确定”的课程被读成“停开”：课程列表显示停开、新增修读被误拒，
+	// 之后任何一次需要保存的操作还会把未定状态写成明确的 false。因此只要
+	// 课程对象显式给出开放状态字段（open/Open/OPEN 及解码后等同的 Unicode
+	// 转义写法，位置不限）而值是 null，整份文件判为内容损坏，哪怕该课程
+	// 尚未被任何要求引用、本次只查看另一名学生也不跳过它继续办理。扫描只读
+	// 不写：不补填状态、不删除课程；字段省略时的既有读取规则（按零值处理）
+	// 不在此列，课程名称、免修依据中的普通文字“null”也不是状态空值。
+	var openNullErr *nullCourseOpenError
+	if err := scanNullCourseOpen(bytes.NewReader(raw)); errors.As(err, &openNullErr) {
+		return nil, true, fmt.Errorf(
+			"记录文件 %s 内容损坏（%v），未做任何修改", path, err)
 	}
 
 	var data fileData

@@ -34,6 +34,179 @@ func (e *duplicateFieldError) Error() string {
 		e.first, e.second, e.field)
 }
 
+// nullCourseOpenError 表示某条课程记录显式提供了开放状态字段，却把值写成
+// JSON 的 null（"open":null，大小写与 Unicode 转义变体同理）。课程编号、
+// 名称与学分合法也不能放过：标准库把 null 解进非指针 bool 时不报错、字段
+// 保持零值 false，于是“状态未确定”的记录被悄悄读成“停开”，课程列表显示
+// 停开、新增修读被误拒，之后任何一次保存还会把未定状态写成明确的 false。
+// 这属于记录内容损坏，必须拒绝整份文件，而不是跳过该课程继续办理。
+//
+// courseID 是该课程对象内 id 字段解码后的编号（字段位置不影响判定，编号
+// 出现在开放状态之后也能取到；课程确实没有编号时为空串）；key 是开放状态
+// 字段的原始写法（解码后文字），用于说明是哪一种写法被写成了 null。
+type nullCourseOpenError struct {
+	courseID string
+	key      string
+}
+
+func (e *nullCourseOpenError) Error() string {
+	id := e.courseID
+	if id == "" {
+		id = "（该课程记录未提供编号）"
+	}
+	return fmt.Sprintf(
+		"课程 %s 的课程开放状态为空：字段 %q 被显式写成 null，开放状态只能是 true（开放）或 false（停开）",
+		id, e.key)
+}
+
+// scanNullCourseOpen 扫描第一份完整 JSON 值的 token 流：只要某个课程对象
+// （courses 数组元素，含最外层键的大小写变体与数组嵌套）显式给出开放状态
+// 字段且值是 JSON null，就返回 *nullCourseOpenError。
+//
+// 与 scanDuplicateKeys 同一思路：字段识别直接照搬正常解码的口径——
+//   - 键名以 JSON 解码后的文字按 strings.EqualFold 与课程结构体的 open
+//     标签比较，open、Open、OPEN 以及解码后等同于这些写法的 \uXXXX 转义
+//     都指向同一状态字段，字段在课程对象中的位置不影响结果；
+//   - 只认“键后紧跟的值 token 就是 nil（JSON null）”这一种情形：字符串
+//     字面量 "null" 是普通文字，课程名称、免修依据里出现它不算状态空值；
+//     开放状态写成对象/数组等其他类型留给结构体解码按类型错误拒绝。
+//
+// 课程对象之外的 null 不由本检查处理：最外层的 null 或空数组继续按既有
+// 读取规则判读（顶层 null/数组本来就不是合法记录），"courses":null 这类
+// 空列表照常按没有课程读取。报错推迟到该课程对象完整读完时发出，这样无论
+// id 字段出现在开放状态之前还是之后，错误都能点名课程编号。
+func scanNullCourseOpen(r io.Reader) error {
+	type frame struct {
+		isObj bool
+		// kind 标识对象类型（决定有哪些可识别字段）；数组帧不用。
+		kind objKind
+		// elem 标识数组元素对象的类型（数组帧使用）。
+		elem objKind
+		// expectKey 仅对对象有意义：true 表示下一个字符串 token 是键
+		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。
+		expectKey bool
+		// pendingKey 是当前值所属的键（解码后文字）。
+		pendingKey string
+		// courseID 记录本课程对象已读到的编号，供报错时点名。
+		courseID string
+		// openNullKey 记录开放状态被写成 null 时该字段的原始写法；
+		// 非空表示本课程对象已构成损坏。
+		openNullKey string
+	}
+	var stack []frame
+	depth := 0
+
+	push := func(d json.Delim) {
+		switch d {
+		case '{':
+			kind := objUnknown
+			if n := len(stack); n == 0 {
+				kind = objFile
+			} else if p := &stack[n-1]; p.isObj {
+				if p.kind == objFile {
+					kind = fileKeyObjectKind(p.pendingKey)
+				}
+			} else {
+				kind = stack[n-1].elem
+			}
+			stack = append(stack, frame{isObj: true, kind: kind, expectKey: true})
+		case '[':
+			elem := objUnknown
+			if n := len(stack); n > 0 {
+				if p := &stack[n-1]; p.isObj {
+					if p.kind == objFile {
+						elem = fileKeyObjectKind(p.pendingKey)
+					}
+				} else {
+					elem = p.elem
+				}
+			}
+			stack = append(stack, frame{isObj: false, elem: elem})
+		}
+	}
+	// valueEnded 通知栈顶对象：刚读完一个值（标量或嵌套结构的结束括号）。
+	valueEnded := func() {
+		if n := len(stack); n > 0 {
+			f := &stack[n-1]
+			if f.isObj && !f.expectKey {
+				f.expectKey = true
+				f.pendingKey = ""
+			}
+		}
+	}
+
+	dec := json.NewDecoder(r)
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			// 语法问题留给随后的结构体解码报告；本检查只负责发现 null 状态。
+			return nil
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{', '[':
+				depth++
+				push(t)
+			case '}', ']':
+				depth--
+				cur := stack[len(stack)-1]
+				if t == '}' && cur.kind == objCourse && cur.openNullKey != "" {
+					// 课程对象已完整读完，id 无论先后都已记录在案。
+					return &nullCourseOpenError{courseID: cur.courseID, key: cur.openNullKey}
+				}
+				stack = stack[:len(stack)-1]
+				if depth == 0 {
+					return nil
+				}
+				valueEnded()
+			}
+		case string:
+			n := len(stack)
+			if n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
+				f := &stack[n-1]
+				f.expectKey = false
+				f.pendingKey = t
+				continue
+			}
+			// 字符串值：在课程对象内顺带记录编号；普通文字 "null" 是字符串
+			// token 而不是 nil，绝不会被当成开放状态空值。
+			if n > 0 && stack[n-1].isObj {
+				f := &stack[n-1]
+				if f.kind == objCourse {
+					if canonical, ok := matchRecordField(objCourse, f.pendingKey); ok && canonical == "id" {
+						f.courseID = t
+					}
+				}
+				valueEnded()
+			}
+			if depth == 0 {
+				return nil
+			}
+		default:
+			// number、bool 等标量值；JSON null 的 token 是无类型 nil。
+			if n := len(stack); n > 0 && stack[n-1].isObj {
+				f := &stack[n-1]
+				if f.kind == objCourse && tok == nil {
+					if canonical, ok := matchRecordField(objCourse, f.pendingKey); ok && canonical == "open" {
+						// 只记第一处；整份文件都会被拒绝，列出哪一门都成立。
+						if f.openNullKey == "" {
+							f.openNullKey = f.pendingKey
+						}
+					}
+				}
+				valueEnded()
+			}
+			if depth == 0 {
+				return nil
+			}
+		}
+	}
+}
+
 // objKind 标识一个 JSON 对象在记录格式中的位置，用于确定该对象有哪些
 // “能被现有读取功能识别”的字段名。
 type objKind int
