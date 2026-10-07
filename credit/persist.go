@@ -112,17 +112,38 @@ func Load(path string) (s *Store, existed bool, err error) {
 			path, err)
 	}
 
-	// 先在 token 流上检查同一 JSON 对象内的字段归属。标准库直接解进结构
-	// 体时会用后一个重复键静默覆盖前一个，而且结构体字段按大小写不敏感
-	// 匹配 json 标签：同一门课程写了 "credit":4 与 "Credit":9（4 会被
-	// 9 悄悄顶替，两个键颠倒又变成 4），最外层同时写 courses 与 COURSES
-	// （后一份即使是空数组也会盖掉前一份），修读里的 student 与 Student
-	// 都无法明确说明字段归属。这样的记录必须整份判为损坏，绝不能据此
-	// 核对或办理——即使冲突只在本次查询没有涉及的课程或免修历史里。
-	// 仅扫描第一份完整值，其后内容仍由下方的“完整记录之后不得有多余
-	// 内容”检查处理。
+	// 在同一遍 token 流扫描里完成两项记录结构检查（共用同一套对象/数组
+	// 层次、记录类别与解码后键名识别口径，见 scanRecordStructure）：
+	//
+	// 1) 同一 JSON 对象内的字段归属只能确定一次。标准库直接解进结构体时
+	// 会用后一个重复键静默覆盖前一个，而且结构体字段按大小写不敏感匹配
+	// json 标签：同一门课程写了 "credit":4 与 "Credit":9（4 会被 9 悄悄
+	// 顶替，两个键颠倒又变成 4），最外层同时写 courses 与 COURSES（后一
+	// 份即使是空数组也会盖掉前一份），修读里的 student 与 Student 都无法
+	// 明确说明字段归属。这样的记录必须整份判为损坏，绝不能据此核对或办
+	// 理——即使冲突只在本次查询没有涉及的课程或免修历史里。
+	//
+	// 2) 显式的 "open":null 必须在结构体解码之前拦截。标准库把 JSON null
+	// 解进非指针 bool 时既不报错也不改字段，零值 false 会被原样保留——
+	// 于是“开放状态未确定”的课程被读成“停开”：课程列表显示停开、新增修
+	// 读被误拒，之后任何一次需要保存的操作还会把未定状态写成明确的
+	// false。因此只要课程编号、名称、学分合法而开放状态显式为空，就拒绝
+	// 整份文件，哪怕该课程尚未被任何要求引用、本次只查看另一名学生也不
+	// 跳过它继续办理。扫描只读不写：不补填状态、不删除课程；字段省略时
+	// 的既有读取规则（按零值处理）不在此列，课程名称、免修依据中的普通
+	// 文字“null”也不是状态空值。
+	//
+	// 两类问题并存时字段冲突优先报告，且不受问题课程在文件中的排列位置
+	// 影响；只扫描第一份完整值，其后内容仍由下方的“完整记录之后不得有
+	// 多余内容”检查处理。
 	var dupErr *duplicateFieldError
-	if err := scanDuplicateKeys(bytes.NewReader(raw)); errors.As(err, &dupErr) {
+	var openNullErr *nullCourseOpenError
+	structureErr := scanRecordStructure(bytes.NewReader(raw), structureChecks{
+		duplicateKeys: true,
+		nullOpen:      true,
+	})
+	switch {
+	case errors.As(structureErr, &dupErr):
 		if dupErr.first == dupErr.second {
 			return nil, true, fmt.Errorf(
 				"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 重复出现，字段归属无法确定），未做任何修改",
@@ -131,21 +152,9 @@ func Load(path string) (s *Store, existed bool, err error) {
 		return nil, true, fmt.Errorf(
 			"记录文件 %s 内容损坏（同一 JSON 对象内字段 %q 与 %q 仅大小写不同，读取时都指向同一记录字段 %q，字段归属无法确定），未做任何修改",
 			path, dupErr.first, dupErr.second, dupErr.field)
-	}
-
-	// 显式的 "open":null 必须在结构体解码之前拦截。标准库把 JSON null 解进
-	// 非指针 bool 时既不报错也不改字段，零值 false 会被原样保留——于是“开放
-	// 状态未确定”的课程被读成“停开”：课程列表显示停开、新增修读被误拒，
-	// 之后任何一次需要保存的操作还会把未定状态写成明确的 false。因此只要
-	// 课程对象显式给出开放状态字段（open/Open/OPEN 及解码后等同的 Unicode
-	// 转义写法，位置不限）而值是 null，整份文件判为内容损坏，哪怕该课程
-	// 尚未被任何要求引用、本次只查看另一名学生也不跳过它继续办理。扫描只读
-	// 不写：不补填状态、不删除课程；字段省略时的既有读取规则（按零值处理）
-	// 不在此列，课程名称、免修依据中的普通文字“null”也不是状态空值。
-	var openNullErr *nullCourseOpenError
-	if err := scanNullCourseOpen(bytes.NewReader(raw)); errors.As(err, &openNullErr) {
+	case errors.As(structureErr, &openNullErr):
 		return nil, true, fmt.Errorf(
-			"记录文件 %s 内容损坏（%v），未做任何修改", path, err)
+			"记录文件 %s 内容损坏（%v），未做任何修改", path, structureErr)
 	}
 
 	var data fileData
