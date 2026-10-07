@@ -630,6 +630,66 @@ func (s *Store) validateApprovedWaiverUniqueness() error {
 	return nil
 }
 
+// invalidApprovedWaiverError 表示待保存记录中有一份状态为有效（approved）的
+// 免修，其归属不成立：所属学生未登记，或目标要求不存在于该学生名下。waiver
+// 是免修编号，student 是记录上的所属学生编号（可能根本未登记），req 是目标
+// 要求编号；noStudent 为 true 表示学生不存在，false 表示学生已登记但本人名下
+// 没有该要求（同号要求只在其他学生名下不算）。
+type invalidApprovedWaiverError struct {
+	waiver    string
+	student   string
+	req       string
+	noStudent bool
+}
+
+func (e *invalidApprovedWaiverError) Error() string {
+	if e.noStudent {
+		return fmt.Sprintf(
+			"有效免修 %s 的所属学生 %s 未登记（目标要求 %s），有效免修必须属于已登记学生",
+			e.waiver, e.student, e.req)
+	}
+	return fmt.Sprintf(
+		"有效免修 %s 的目标要求 %s 不存在于学生 %s 本人名下",
+		e.waiver, e.req, e.student)
+}
+
+// validateApprovedWaiverOwnership 检查每份有效免修的归属：所属学生必须已登记，
+// 目标要求必须实际存在于该学生本人名下。
+//
+// 正常申请流程（ApplyWaiver）只会为学生名下确实存在的要求生效免修，读取记录
+// 文件（loadData）也拒绝归属不成立的有效免修；但调用方取得免修记录后可以
+// 直接修改其内容——把目标要求改成不存在的编号、改成只属于另一名学生的同号
+// 要求，或把所属学生改成未登记的编号——这样写出的文件随后必然被 Load 判为
+// 内容损坏。因此这样的待保存记录必须在序列化与临时文件之前整次拒绝保存：
+// 绝不跳过这份申请只保存其他记录，也不自动创建要求、转移学生归属、把状态改
+// 成已拒绝或删除申请，更不能用这份记录替换掉原本可用的记录文件。
+//
+// 判定只反映本次待保存记录的内容：按免修当前携带的所属学生编号与目标要求
+// 编号在索引中查找，原编号被调用方改动后不再以修改前的匹配结果为准。编号
+// 按完整文字匹配，大小写与前后空白都是编号内容；要求编号只在另一名学生名下
+// 存在不能作为放行依据。依据充分、同一要求没有第二份有效免修，都不能替代
+// 这项归属条件。已拒绝的申请允许保留当时不存在的目标要求及原拒绝原因，
+// 已撤销申请沿用现有规则，两者都不参与本检查。
+func (s *Store) validateApprovedWaiverOwnership() error {
+	for _, w := range s.waivers {
+		if w == nil || w.Status != WaiverApproved {
+			// 失效申请（已拒绝/已撤销）不满足任何要求，沿用既有规则。
+			continue
+		}
+		if _, ok := s.studentByID[w.StudentID]; !ok {
+			return &invalidApprovedWaiverError{
+				waiver: w.ID, student: w.StudentID, req: w.ReqID, noStudent: true,
+			}
+		}
+		if s.reqByKey[reqKey(w.StudentID, w.ReqID)] == nil {
+			return &invalidApprovedWaiverError{
+				waiver: w.ID, student: w.StudentID, req: w.ReqID,
+			}
+		}
+	}
+	return nil
+}
+
 // checkSaveText 校验单个待保存字段的文字是否为合法 UTF-8。
 func checkSaveText(category, id, field, value string) error {
 	if !utf8.ValidString(value) {
@@ -641,7 +701,7 @@ func checkSaveText(category, id, field, value string) error {
 // Save 将全部记录原子写入 path：先写同目录临时文件，再重命名覆盖，
 // 避免写到一半时损坏原文件。
 //
-// 写入前先做三项检查：
+// 写入前先做四项检查：
 //
 // 一是全部待保存字符串都必须是合法 UTF-8：标准库序列化会把非法字节静默
 // 替换成 U+FFFD，因此含非法文字的数据绝不能进入序列化与临时文件阶段。
@@ -672,6 +732,21 @@ func checkSaveText(category, id, field, value string) error {
 // 申请之间夹着其他合法历史都不能掩盖冲突。不同学生各自拥有同号要求、同号
 // 免修是合法的；同一学生的不同要求各有一份有效免修也正常保存；已拒绝、
 // 已撤销的历史不占用有效名额，与一份有效免修共存时照常保存。
+//
+// 四是每份有效免修的归属必须成立：所属学生已登记，且目标要求实际存在于该
+// 学生本人名下。正常申请流程与 Load 都只承认归属成立的有效免修，但调用方
+// 取得免修记录后可以直接改内容（把目标要求改成不存在的编号或只属于另一名
+// 学生的同号要求、把所属学生改成未登记的编号、把曾因目标不存在而被拒绝的
+// 申请直接改成有效），这样写出的文件随后必然被 Load 判为内容损坏。因此
+// 直接拒绝整次保存：错误点名目标文件、免修编号、所属学生编号与目标要求
+// 编号，并说明学生不存在或本人名下不存在该要求；已有文件全部内容原样保留，
+// 目标原本不存在时不创建记录文件也不遗留临时文件；待保存的内存记录同样
+// 原样保留——不跳过这份申请只保存其他记录，不自动创建要求、不转移学生
+// 归属、不改成已拒绝状态，也不删除申请。判定只反映本次待保存记录的内容，
+// 编号按完整文字匹配（大小写与前后空白都是编号内容），要求编号只在另一名
+// 学生名下存在不能放行；依据充分、同一要求没有第二份有效免修，都不能替代
+// 这项归属条件。已拒绝的申请允许保留当时不存在的目标要求及原拒绝原因，
+// 已撤销申请沿用现有规则，两者都不参与本检查。
 func (s *Store) Save(path string) (err error) {
 	if err := s.validateSaveText(); err != nil {
 		return fmt.Errorf("记录中存在无法原样保存的文字，拒绝写入 %s：%w", path, err)
@@ -681,6 +756,9 @@ func (s *Store) Save(path string) (err error) {
 	}
 	if err := s.validateApprovedWaiverUniqueness(); err != nil {
 		return fmt.Errorf("记录中存在有效免修冲突，拒绝写入 %s，已有文件保持原样：%w", path, err)
+	}
+	if err := s.validateApprovedWaiverOwnership(); err != nil {
+		return fmt.Errorf("记录中存在归属不成立的有效免修，拒绝写入 %s，已有文件保持原样：%w", path, err)
 	}
 	data := fileData{
 		Version:       recordVersion,
