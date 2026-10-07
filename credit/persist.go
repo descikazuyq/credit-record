@@ -521,6 +521,63 @@ func (s *Store) validateSaveText() error {
 	return nil
 }
 
+// duplicateResultSeqError 表示待保存记录中有两份不同修读的已提交成绩共用同一个
+// 正整数结果提交顺序编号。seq 是冲突的编号；first/second 各用完整学生编号与
+// 修读编号共同指明冲突双方，便于调用方分辨不同学生名下编号相同的修读（例如
+// 两名学生各有一份 e1）。顺序按修读在记录中的先后确定，first 先出现。
+type duplicateResultSeqError struct {
+	seq           int
+	firstStudent  string
+	firstEnr      string
+	secondStudent string
+	secondEnr     string
+}
+
+func (e *duplicateResultSeqError) Error() string {
+	return fmt.Sprintf(
+		"成绩提交顺序编号 %d 被两份不同修读的已提交成绩共用：学生 %s 的修读 %s 与学生 %s 的修读 %s",
+		e.seq, e.firstStudent, e.firstEnr, e.secondStudent, e.secondEnr)
+}
+
+// validateResultSeqUniqueness 检查全部已提交成绩的结果提交顺序编号互不相同。
+//
+// 顺序编号刻画的是整份记录中每次“首次提交成绩”的先后，通过与未通过都占用
+// 一次编号，它不按学生、课程要求或学期各自编号：同一学生的重复修读、不同
+// 要求下的独立提交、不同学生的独立修读，只要两份不同修读的已提交成绩共用
+// 同一个正整数编号，写出的文件随后就会被 Load 判为内容损坏。因此这样的
+// 待保存记录必须在序列化与临时文件之前整次拒绝保存——绝不删修读、不替
+// 调用方重新编号、不清成绩或免修历史，也不能用这份记录替换掉原本可用的
+// 记录文件。
+//
+// 尚未提交结果、仍处于选课状态的修读沿用编号 0，多份并存不构成重复，本
+// 检查直接跳过它们；判定只看已提交成绩携带的正整数编号，因此已提交编号有
+// 空缺（不连续）合法，冲突记录之间夹着其他正常成绩或免修也不能掩盖冲突。
+// 以修读在记录中的先后取最先相撞的一对，结果确定且与 map 遍历顺序无关。
+func (s *Store) validateResultSeqUniqueness() error {
+	first := map[int]*Enrollment{}
+	for _, e := range s.enrollments {
+		if e == nil || e.Result == Enrolled {
+			// 选课记录的编号一律是 0，多份并存正常，不参与重复判定。
+			continue
+		}
+		if e.ResultSeq <= 0 {
+			// 本规则只管“正整数顺序编号被共用”：非正编号不是这里的判定对象。
+			continue
+		}
+		if prev := first[e.ResultSeq]; prev != nil {
+			return &duplicateResultSeqError{
+				seq:           e.ResultSeq,
+				firstStudent:  prev.StudentID,
+				firstEnr:     prev.ID,
+				secondStudent: e.StudentID,
+				secondEnr:     e.ID,
+			}
+		}
+		first[e.ResultSeq] = e
+	}
+	return nil
+}
+
 // checkSaveText 校验单个待保存字段的文字是否为合法 UTF-8。
 func checkSaveText(category, id, field, value string) error {
 	if !utf8.ValidString(value) {
@@ -532,14 +589,30 @@ func checkSaveText(category, id, field, value string) error {
 // Save 将全部记录原子写入 path：先写同目录临时文件，再重命名覆盖，
 // 避免写到一半时损坏原文件。
 //
-// 写入前先校验全部待保存字符串都是合法 UTF-8：标准库序列化会把非法字节
-// 静默替换成 U+FFFD，因此含非法文字的数据绝不能进入序列化与临时文件阶段。
+// 写入前先做两项检查：
+//
+// 一是全部待保存字符串都必须是合法 UTF-8：标准库序列化会把非法字节静默
+// 替换成 U+FFFD，因此含非法文字的数据绝不能进入序列化与临时文件阶段。
 // 校验失败时整次保存直接返回错误——不创建/不改动目标文件（目标原本不
 // 存在时也不会留下新记录文件或临时文件），不替换、清空或修补待保存记录
 // 中的任何原始字符串，即使问题只出现在一条已拒绝或已撤销免修的字段里。
+//
+// 二是全部已提交成绩的结果提交顺序编号互不相同：顺序编号表示整份记录中
+// 每次首次提交成绩的先后，通过与未通过都占用一次编号，不按学生、要求或
+// 学期各自编号。两份不同修读（同一学生的重复修读或不同学生的独立修读，
+// 无论修读编号、要求编号、学期是否相同，也无论两条记录是否相邻）的已提交
+// 成绩共用同一个正整数编号时，写出的文件随后必然被 Load 判为内容损坏，
+// 因此直接拒绝整次保存：错误点名目标文件、重复编号及冲突双方（完整学生
+// 编号 + 修读编号），已有文件全部内容原样保留，目标原本不存在时不创建
+// 记录文件也不遗留临时文件；待保存的内存记录同样原样保留——不删修读、
+// 不替调用方调整顺序、不清成绩或免修历史。仍是选课、尚未提交结果的修读
+// 沿用编号 0，多份并存不构成重复；已提交编号有空缺（不连续）仍合法。
 func (s *Store) Save(path string) (err error) {
 	if err := s.validateSaveText(); err != nil {
 		return fmt.Errorf("记录中存在无法原样保存的文字，拒绝写入 %s：%w", path, err)
+	}
+	if err := s.validateResultSeqUniqueness(); err != nil {
+		return fmt.Errorf("记录中的成绩提交顺序编号冲突，拒绝写入 %s，已有文件保持原样：%w", path, err)
 	}
 	data := fileData{
 		Version:       recordVersion,
