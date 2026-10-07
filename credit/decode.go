@@ -539,6 +539,210 @@ func scanNullCourseOpen(r io.Reader) error {
 	return walkFirstRecordValue(r, false, hooks)
 }
 
+// rejectReasonProblem 说明已拒绝免修的拒绝原因是以哪种方式缺失的。
+type rejectReasonProblem int
+
+const (
+	// reasonAbsent：免修对象里根本没有 reason 字段。
+	reasonAbsent rejectReasonProblem = iota
+	// reasonNull：reason 字段被显式写成 JSON null。
+	reasonNull
+	// reasonBlank：reason 是空字符串或只含空白字符的字符串。
+	reasonBlank
+	// reasonWrongType：reason 的值不是字符串（number、bool、对象或数组）。
+	reasonWrongType
+)
+
+// missingRejectReasonError 表示某条状态为 rejected 的免修申请没有保留含
+// 实际文字的拒绝原因。被拒绝的申请必须能说明当时为什么没有生效：缺了原因，
+// check 列出的申请就无从解释，随后登记其他记录还可能把这份不完整历史继续
+// 保存下去。因此这属于记录内容损坏，必须拒绝整份文件，而不是把它当成没有
+// 原因的正常历史继续核对或保存——哪怕这条申请不属于本次查询的学生，或其
+// 目标要求已另有通过修读、有效免修、照常能算出学分。
+//
+// studentID/waiverID 分别是该免修对象内 student、id 字段解码后的文字
+// （字段位置不影响判定，编号出现在原因之后也能取到；对象确实没有该字段时
+// 为空串）；key 是原因字段的原始写法（解码后文字），reasonAbsent 时为空。
+type missingRejectReasonError struct {
+	studentID string
+	waiverID  string
+	key       string
+	problem   rejectReasonProblem
+}
+
+func (e *missingRejectReasonError) Error() string {
+	student := e.studentID
+	if student == "" {
+		student = "（该免修记录未提供学生编号）"
+	}
+	waiver := e.waiverID
+	if waiver == "" {
+		waiver = "（该免修记录未提供免修编号）"
+	}
+	head := fmt.Sprintf("学生 %s 的已拒绝免修 %s 缺少拒绝原因", student, waiver)
+	switch e.problem {
+	case reasonNull:
+		return fmt.Sprintf(
+			"%s：字段 %q 被显式写成 null，已拒绝申请必须保留含实际文字的拒绝原因",
+			head, e.key)
+	case reasonBlank:
+		return head + "：原因为空字符串或只含空白字符，已拒绝申请必须保留含实际文字的拒绝原因"
+	case reasonWrongType:
+		return fmt.Sprintf(
+			"%s：原因字段 %q 不是文字，已拒绝申请的拒绝原因必须是含实际文字的字符串",
+			head, e.key)
+	default:
+		return head + "：记录中没有原因字段，已拒绝申请必须保留含实际文字的拒绝原因"
+	}
+}
+
+// scanRejectedWaiverReasons 扫描第一份完整 JSON 值的 token 流：只要某个
+// 免修对象（waivers 数组元素，含最外层键的大小写变体与数组嵌套）的状态
+// 确为字符串 "rejected"，其 reason 就必须是含实际文字的字符串，否则返回
+// *missingRejectReasonError。
+//
+// 必须在结构体解码之前单独扫描，因为仅看解码后的 Waiver.Reason（普通
+// string）区分不了“字段没有出现”“"reason":null”与 "reason":""：标准库
+// 把缺失字段与 JSON null 都解成零值空串，而这三种情形本次都要拒绝。
+//
+// 与 scanNullCourseOpen、scanDuplicateKeys 共用同一遍历与字段识别口径
+// （见 walkFirstRecordValue 与 matchRecordField）：
+//   - 键名以 JSON 解码后的文字按 strings.EqualFold 与免修结构体的标签
+//     比较，reason、Reason、REASON 以及解码后等同的 \uXXXX 转义都指向
+//     同一原因字段，student、id、status 同理，字段在对象中的位置不影响
+//     结果，编号/学生出现在原因之后仍能在对象闭合时点名；
+//   - “空白”按 strings.TrimSpace 的 Unicode 口径判定：普通空格、制表符、
+//     换行、回车、全角空格（U+3000）、不换行空格（U+00A0）等任意混用仍算
+//     没有原因；扫描只判定不修剪，含实际文字的原因连同其前后、中间空白
+//     原样保留；
+//   - 只校验状态值确为字符串 "rejected" 的申请。有效（approved）免修原本
+//     就可以没有 reason，已撤销（revoked）免修沿用既有读取与核对行为，
+//     二者都不增加原因限制；状态写成 null、number 等非字符串情形由结构体
+//     解码与随后的 loadData 按类型/非法状态拒绝，本扫描不替它们改口。
+//
+// 报错推迟到该免修对象完整读完时（objectEnd）发出，这样无论 id、student
+// 出现在原因字段之前还是之后，错误都能点名学生与免修编号。
+func scanRejectedWaiverReasons(r io.Reader) error {
+	type waiverState struct {
+		studentID string
+		waiverID  string
+
+		// status 确为字符串值时记录解码后的文字并置 statusKnown；status
+		// 为 null/其他类型时 statusKnown 保持 false（留给解码阶段拒绝）。
+		statusKnown bool
+		statusValue string
+
+		// reason 字段出现后，其值归为互斥的四类：字符串（reasonString，
+		// 文字记在 reasonValue）、JSON null（reasonNull）、其余标量或
+		// 对象/数组（reasonNotText）。键一出现先按“非文字”待定，直接的
+		// 字符串/标量值回调再把它改成确切类别；对象、数组值不会在免修帧
+		// 上触发值回调，于是保持“非文字”，与 number、bool 同一口径拒绝。
+		reasonPresent bool
+		reasonKey     string
+		reasonString  bool
+		reasonValue   string
+		reasonNull    bool
+		reasonNotText bool
+	}
+	// 每个对象一份状态，随遍历器的 objectStart/objectEnd 成对压退；只有
+	// 免修对象会写入其中字段。
+	var states []waiverState
+
+	hooks := recordTokenHooks{
+		objectStart: func(objKind) {
+			states = append(states, waiverState{})
+		},
+		objectEnd: func(kind objKind) error {
+			st := states[len(states)-1]
+			states = states[:len(states)-1]
+			if kind != objWaiver || !st.statusKnown || st.statusValue != string(WaiverRejected) {
+				return nil
+			}
+			// 免修对象已完整读完，id/student 无论先后都已记录在案。
+			switch {
+			case !st.reasonPresent:
+				return &missingRejectReasonError{
+					studentID: st.studentID, waiverID: st.waiverID, problem: reasonAbsent}
+			case st.reasonNull:
+				return &missingRejectReasonError{
+					studentID: st.studentID, waiverID: st.waiverID,
+					key: st.reasonKey, problem: reasonNull}
+			case !st.reasonString:
+				// number、bool 或对象、数组：拒绝原因必须是文字。
+				return &missingRejectReasonError{
+					studentID: st.studentID, waiverID: st.waiverID,
+					key: st.reasonKey, problem: reasonWrongType}
+			case strings.TrimSpace(st.reasonValue) == "":
+				return &missingRejectReasonError{
+					studentID: st.studentID, waiverID: st.waiverID,
+					key: st.reasonKey, problem: reasonBlank}
+			}
+			return nil
+		},
+		key: func(kind objKind, key string) error {
+			if kind != objWaiver {
+				return nil
+			}
+			if canonical, ok := matchRecordField(objWaiver, key); ok && canonical == "reason" {
+				st := &states[len(states)-1]
+				st.reasonPresent = true
+				st.reasonKey = key
+				// 先按“非文字”待定；直接的字符串/标量值回调会覆盖它，
+				// 对象/数组值不触发值回调，最终仍按非文字拒绝。
+				st.reasonNotText = true
+			}
+			return nil
+		},
+		stringValue: func(kind objKind, key, value string) error {
+			if kind != objWaiver {
+				return nil
+			}
+			st := &states[len(states)-1]
+			canonical, ok := matchRecordField(objWaiver, key)
+			if !ok {
+				return nil
+			}
+			switch canonical {
+			case "id":
+				st.waiverID = value
+			case "student":
+				st.studentID = value
+			case "status":
+				// 只有字符串值才算“确为某状态”；状态值区分大小写，
+				// "Rejected" 等不是合法状态，由解码阶段拒绝。
+				st.statusValue = value
+				st.statusKnown = true
+			case "reason":
+				st.reasonString = true
+				st.reasonNotText = false
+				st.reasonValue = value
+			}
+			return nil
+		},
+		scalarValue: func(kind objKind, key string, tok any) error {
+			if kind != objWaiver {
+				return nil
+			}
+			canonical, ok := matchRecordField(objWaiver, key)
+			if !ok || canonical != "reason" {
+				return nil
+			}
+			// JSON null 的 token 是无类型 nil；number、bool 等其余标量
+			// 也不是合法原因文字，二者都要拒绝，只是说明措辞不同。
+			st := &states[len(states)-1]
+			st.reasonNotText = false
+			if tok == nil {
+				st.reasonNull = true
+			} else {
+				st.reasonNotText = true
+			}
+			return nil
+		},
+	}
+	// 语法问题留给随后的结构体解码报告；本检查只负责发现缺失的拒绝原因。
+	return walkFirstRecordValue(r, false, hooks)
+}
+
 // scanStringUnicode 按原始字节扫描第一份完整 JSON 值里的全部字符串
 // （字段名与字段值），验证每个字符串都能还原为合法 Unicode 文字：
 //   - 字符串中直接写入的字节必须是合法 UTF-8；

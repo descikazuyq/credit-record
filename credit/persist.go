@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -65,6 +66,20 @@ type fileData struct {
 // 按内容损坏拒绝读取，即使该要求另有通过修读也不例外。已拒绝申请的依据允许
 // 为空或只有空白。检查只读不写：不会补填依据、不会改动免修状态，也不会修剪
 // 含实际文字的依据中原有空白。
+//
+// 已拒绝（rejected）免修必须保留含实际文字的拒绝原因：reason 字段没有出现、
+// 显式写成 JSON null、空字符串，或只含空白字符（空格、制表符、换行、回车、
+// 全角空格 U+3000、不换行空格 U+00A0 等，允许混用），都算没有原因，整份记录
+// 按内容损坏拒绝读取。被拒绝的申请必须能说明当时为什么没有生效，缺了原因的
+// 文件不能作为正常学分记录继续使用：只要文件中有一份这样的申请就整份拒绝，
+// 哪怕它不属于本次查询的学生，或其目标要求已另有通过修读、有效免修、照常能
+// 算出学分，也不能跳过这份历史。字段名大小写与 Unicode 转义沿用既有识别规则
+// （reason、Reason、REASON 及解码后等同的转义写法都指向同一字段），字段在
+// 免修对象中的位置不影响结果。含实际文字的原因按原文保留（包括前后与中间的
+// 空白），不要求固定措辞，也不根据当前课程要求重新判断旧申请；因依据为空被
+// 拒绝的申请仍允许保留空依据。检查只读不写：不补写推测的原因、不删除申请、
+// 不把状态改成有效。有效免修原本可以没有 reason，已撤销免修沿用既有读取与
+// 核对行为，二者都不增加原因限制。
 //
 // 课程开放状态字段显式写成 JSON null（"open":null，open、Open、OPEN 及解码
 // 后等同的 Unicode 转义写法都指向同一字段，字段在课程对象中的位置不影响
@@ -144,6 +159,22 @@ func Load(path string) (s *Store, existed bool, err error) {
 	// 不在此列，课程名称、免修依据中的普通文字“null”也不是状态空值。
 	var openNullErr *nullCourseOpenError
 	if err := scanNullCourseOpen(bytes.NewReader(raw)); errors.As(err, &openNullErr) {
+		return nil, true, fmt.Errorf(
+			"记录文件 %s 内容损坏（%v），未做任何修改", path, err)
+	}
+
+	// 已拒绝免修必须保留含实际文字的拒绝原因，同样要在结构体解码之前拦截：
+	// 解码后的 Waiver.Reason 是普通 string，字段没有出现、"reason":null 与
+	// "reason":"" 都会变成零值空串，无法区分，而这三种（连同只含空白的字符
+	// 串）本次都要拒绝。被拒绝的申请必须能说明当时为什么没有生效；缺了原因，
+	// check 列出的申请就没有解释，随后登记其他记录还会把这份不完整历史继续
+	// 保存。只要文件中有一份这样的已拒绝申请就整份判为内容损坏——哪怕它不
+	// 属于本次查询的学生，或其目标要求已另有通过修读、有效免修、照常能算出
+	// 学分，也不能跳过这份历史继续办理。扫描只读不写：不补写推测的原因、不
+	// 删除申请、不把状态改成有效。有效免修原本可以没有 reason，已撤销免修
+	// 沿用既有读取与核对行为，两者都不受此限制。
+	var missingReasonErr *missingRejectReasonError
+	if err := scanRejectedWaiverReasons(bytes.NewReader(raw)); errors.As(err, &missingReasonErr) {
 		return nil, true, fmt.Errorf(
 			"记录文件 %s 内容损坏（%v），未做任何修改", path, err)
 	}
@@ -345,6 +376,18 @@ func (s *Store) loadData(d *fileData) error {
 			}
 			if blankBasis(w.Basis) {
 				return fmt.Errorf("学生 %s 的已撤销免修 %s 原依据为空", w.StudentID, w.ID)
+			}
+		case WaiverRejected:
+			// 已拒绝申请必须保留含实际文字的拒绝原因（字段缺失、null、空串
+			// 或全部为空白字符都算没有原因）。正常读取时这一点已由
+			// scanRejectedWaiverReasons 在结构体解码之前保证（缺失与 null 经
+			// 解码都会变成空串，无法再区分，所以必须在扫描阶段拦截）；这里
+			// 再兜底一次，使“拒绝历史必有原因”成为 loadData 自身的不变量，
+			// 直接构造 fileData 调用本函数也绕不过去。检查只读不写：不补写
+			// 推测的原因、不删除申请、不把状态改成有效。
+			if strings.TrimSpace(w.Reason) == "" {
+				return fmt.Errorf("学生 %s 的已拒绝免修 %s 缺少拒绝原因（原因为空或全部为空白字符）",
+					w.StudentID, w.ID)
 			}
 		}
 		key := reqKey(w.StudentID, w.ID)
