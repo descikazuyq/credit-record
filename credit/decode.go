@@ -59,154 +59,6 @@ func (e *nullCourseOpenError) Error() string {
 		id, e.key)
 }
 
-// scanNullCourseOpen 扫描第一份完整 JSON 值的 token 流：只要某个课程对象
-// （courses 数组元素，含最外层键的大小写变体与数组嵌套）显式给出开放状态
-// 字段且值是 JSON null，就返回 *nullCourseOpenError。
-//
-// 与 scanDuplicateKeys 同一思路：字段识别直接照搬正常解码的口径——
-//   - 键名以 JSON 解码后的文字按 strings.EqualFold 与课程结构体的 open
-//     标签比较，open、Open、OPEN 以及解码后等同于这些写法的 \uXXXX 转义
-//     都指向同一状态字段，字段在课程对象中的位置不影响结果；
-//   - 只认“键后紧跟的值 token 就是 nil（JSON null）”这一种情形：字符串
-//     字面量 "null" 是普通文字，课程名称、免修依据里出现它不算状态空值；
-//     开放状态写成对象/数组等其他类型留给结构体解码按类型错误拒绝。
-//
-// 课程对象之外的 null 不由本检查处理：最外层的 null 或空数组继续按既有
-// 读取规则判读（顶层 null/数组本来就不是合法记录），"courses":null 这类
-// 空列表照常按没有课程读取。报错推迟到该课程对象完整读完时发出，这样无论
-// id 字段出现在开放状态之前还是之后，错误都能点名课程编号。
-func scanNullCourseOpen(r io.Reader) error {
-	type frame struct {
-		isObj bool
-		// kind 标识对象类型（决定有哪些可识别字段）；数组帧不用。
-		kind objKind
-		// elem 标识数组元素对象的类型（数组帧使用）。
-		elem objKind
-		// expectKey 仅对对象有意义：true 表示下一个字符串 token 是键
-		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。
-		expectKey bool
-		// pendingKey 是当前值所属的键（解码后文字）。
-		pendingKey string
-		// courseID 记录本课程对象已读到的编号，供报错时点名。
-		courseID string
-		// openNullKey 记录开放状态被写成 null 时该字段的原始写法；
-		// 非空表示本课程对象已构成损坏。
-		openNullKey string
-	}
-	var stack []frame
-	depth := 0
-
-	push := func(d json.Delim) {
-		switch d {
-		case '{':
-			kind := objUnknown
-			if n := len(stack); n == 0 {
-				kind = objFile
-			} else if p := &stack[n-1]; p.isObj {
-				if p.kind == objFile {
-					kind = fileKeyObjectKind(p.pendingKey)
-				}
-			} else {
-				kind = stack[n-1].elem
-			}
-			stack = append(stack, frame{isObj: true, kind: kind, expectKey: true})
-		case '[':
-			elem := objUnknown
-			if n := len(stack); n > 0 {
-				if p := &stack[n-1]; p.isObj {
-					if p.kind == objFile {
-						elem = fileKeyObjectKind(p.pendingKey)
-					}
-				} else {
-					elem = p.elem
-				}
-			}
-			stack = append(stack, frame{isObj: false, elem: elem})
-		}
-	}
-	// valueEnded 通知栈顶对象：刚读完一个值（标量或嵌套结构的结束括号）。
-	valueEnded := func() {
-		if n := len(stack); n > 0 {
-			f := &stack[n-1]
-			if f.isObj && !f.expectKey {
-				f.expectKey = true
-				f.pendingKey = ""
-			}
-		}
-	}
-
-	dec := json.NewDecoder(r)
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			// 语法问题留给随后的结构体解码报告；本检查只负责发现 null 状态。
-			return nil
-		}
-		switch t := tok.(type) {
-		case json.Delim:
-			switch t {
-			case '{', '[':
-				depth++
-				push(t)
-			case '}', ']':
-				depth--
-				cur := stack[len(stack)-1]
-				if t == '}' && cur.kind == objCourse && cur.openNullKey != "" {
-					// 课程对象已完整读完，id 无论先后都已记录在案。
-					return &nullCourseOpenError{courseID: cur.courseID, key: cur.openNullKey}
-				}
-				stack = stack[:len(stack)-1]
-				if depth == 0 {
-					return nil
-				}
-				valueEnded()
-			}
-		case string:
-			n := len(stack)
-			if n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
-				f := &stack[n-1]
-				f.expectKey = false
-				f.pendingKey = t
-				continue
-			}
-			// 字符串值：在课程对象内顺带记录编号；普通文字 "null" 是字符串
-			// token 而不是 nil，绝不会被当成开放状态空值。
-			if n > 0 && stack[n-1].isObj {
-				f := &stack[n-1]
-				if f.kind == objCourse {
-					if canonical, ok := matchRecordField(objCourse, f.pendingKey); ok && canonical == "id" {
-						f.courseID = t
-					}
-				}
-				valueEnded()
-			}
-			if depth == 0 {
-				return nil
-			}
-		default:
-			// number、bool 等标量值；JSON null 的 token 是无类型 nil。
-			if n := len(stack); n > 0 && stack[n-1].isObj {
-				f := &stack[n-1]
-				if f.kind == objCourse && tok == nil {
-					if canonical, ok := matchRecordField(objCourse, f.pendingKey); ok && canonical == "open" {
-						// 只记第一处；整份文件都会被拒绝，列出哪一门都成立。
-						if f.openNullKey == "" {
-							f.openNullKey = f.pendingKey
-						}
-					}
-				}
-				valueEnded()
-			}
-			if depth == 0 {
-				return nil
-			}
-		}
-	}
-}
-
 // objKind 标识一个 JSON 对象在记录格式中的位置，用于确定该对象有哪些
 // “能被现有读取功能识别”的字段名。
 type objKind int
@@ -224,10 +76,10 @@ const (
 // recordObjectTypes 把每类对象对应到它在记录格式中的结构体类型。各类对象
 // “能被读取功能识别哪些字段名”只有结构体定义上的 json 标签这一个出处：
 // 正常读取时 json.Decoder 按这些标签（先精确名、再大小写折叠名）填入字段，
-// 重复字段扫描也从同一份结构体定义取字段名。调整一项记录的字段（增删、
-// 改名、换标签）只需改结构体定义，正常读取与重复检查始终对“哪些字段可
-// 识别、哪些写法指向同一字段”作出一致判断，不需要再同步另一份字段名称
-// 清单。
+// 字段重复扫描与课程开放状态扫描也从同一份结构体定义取字段名。调整一项
+// 记录的字段（增删、改名、换标签）只需改结构体定义，正常读取与两项扫描
+// 始终对“哪些字段可识别、哪些写法指向同一字段、键下是不是课程对象”作出
+// 一致判断，不需要再同步另一份字段名称清单。
 var recordObjectTypes = map[objKind]reflect.Type{
 	objFile:        reflect.TypeOf(fileData{}),
 	objCourse:      reflect.TypeOf(Course{}),
@@ -295,7 +147,8 @@ func buildRecordFields() map[objKind][]string {
 // 例如 U+212A“K”折到 k、U+0130“İ”折到 i）。这里照搬同一判定，字段名又
 // 直接来自结构体标签，才能保证“两个键名被现有读取功能识别为同一字段”的
 // 口径与实际解码完全一致——任何大小写或 Unicode 转义组合都无法让一个键
-// 绕过本扫描却仍被解码器接受。
+// 绕过本扫描却仍被解码器接受。字段归属唯一性检查与课程开放状态检查都经
+// 由这同一个入口识别字段，两者口径始终相同。
 func matchRecordField(kind objKind, key string) (string, bool) {
 	for _, tag := range recordFields[kind] {
 		if strings.EqualFold(key, tag) {
@@ -336,32 +189,58 @@ func fileKeyObjectKind(key string) objKind {
 	return objUnknown
 }
 
-// scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
-// 字段归属唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后
-// 是否还拼接了多余内容，那里的报错信息需要与本检查区分开）。
+// recordTokenHooks 是 walkFirstRecordValue 向具体检查开放的时机。
+// 字段归属检查与课程开放状态检查只提供各自的“发现规则”，不再各自处理
+// 对象与数组的层次、记录类别推导，以及键与字符串值的区分——这些共通规则
+// 全部集中在遍历器一处维护。
 //
-// 背景：encoding/json 直接解进结构体（或 map）时，同一对象内的重复键会被
-// 后一个静默覆盖，而且结构体字段按大小写折叠匹配 json 标签（规则等同于
-// strings.EqualFold）——同一门课程同时写 "credit":4 与 "Credit":9 时，
-// 标准库读不出“曾经写过两个”，学分直接被后一个值顶替，两个键先后颠倒
-// 结果也随之颠倒。因此在正常结构体解码之前先单独扫描一遍 token 流。
+// 回调拿到的 kind/key 都由遍历器按记录结构推导：
+//   - objectStart 在每个对象（含根对象）压栈后调用一次，kind 是该对象在
+//     记录格式中的类别（objUnknown 表示不属于记录格式的对象）；
+//   - key 在对象内读到键时调用，key 是 JSON 解码后的键名原文（\uXXXX
+//     转义已还原），与正常解码时看到的写法不可区分；
+//   - stringValue 在读到字符串“值”（不是键）时调用，key 是其所属键的
+//     原文，value 是解码后的文字；
+//   - scalarValue 在读到其余标量值（number、bool、null）时调用，key 是
+//     其所属键的原文；tok 为无类型 nil 时即 JSON null——字符串字面量
+//     "null" 走 stringValue，绝不会以 nil 出现，名称、依据里的“null”
+//     文字因此天然不被当成空值；
+//   - objectEnd 在对象的 '}' 读到、结构帧出栈之前调用，便于检查汇总整个
+//     对象（如课程编号出现在问题字段之后，仍能在对象闭合时点名课程）。
 //
-// 规则：
-//   - 同一个 JSON 对象内字段归属只能确定一次：完全同名的两个键，或两个
-//     键名在大小写折叠后都指向同一条可识别记录字段（如 credit 与
-//     Credit、student 与 Student、courses 与 COURSES），发现即返回
-//     *duplicateFieldError（含规范字段名与两个原始写法）。
-//   - 字段顺序、是否相邻、两个值是否相同都不影响判定。
-//   - 比较以 JSON 解码后的文字为准：Token() 返回的键名已完成 Unicode
-//     反转义，所以 "credit"、它的 \uXXXX 转义写法与 "Credit" 之间任意
-//     两两组合都按解码后实际所指的字段判断，不能用转义加大小写的组合
-//     绕开限制。
-//   - 限制只针对同一对象：对象与数组可任意嵌套，数组各元素、不同课程或
-//     不同学生等不同对象各自携带同名字段是正常结构，互不比较。
-//   - 不能被读取功能识别的字段不参与折叠归并，但完全同名仍按重复拒绝；
-//     真正的未知字段留给随后的 DisallowUnknownFields 解码阶段拒绝。
-//   - 字符串“值”里出现字段名（依据、课程名称等）不是键，不参与检查。
-func scanDuplicateKeys(r io.Reader) error {
+// 数组本身不产生回调；数组各元素对象照常成对触发 objectStart/objectEnd。
+// 任一带返回值的回调返回非 nil 错误时，遍历立即中止并原样返回该错误。
+type recordTokenHooks struct {
+	objectStart func(kind objKind)
+	key         func(kind objKind, key string) error
+	stringValue func(kind objKind, key, value string) error
+	scalarValue func(kind objKind, key string, tok any) error
+	objectEnd   func(kind objKind) error
+}
+
+// walkFirstRecordValue 遍历第一份完整 JSON 值的 token 流：按记录结构维护
+// 对象/数组栈，把“对象起止、键、标量值”四个时机交给 hooks。第一份值之后
+// 的字节一律不读——调用方另行检查完整记录之后是否拼接了多余内容，那里的
+// 报错信息必须与本遍历中的检查区分开。
+//
+// 对象类别与正常解码同一出处（见 fileKeyObjectKind）：根对象是最外层
+// fileData；对象直接挂在最外层对象的某个键下时，类别由该键按大小写折叠
+// 推导（courses 与 COURSES 之下都是课程对象）；对象在数组里时类别跟随
+// 承载它的数组，数组嵌套则逐层沿用——顶层键的大小写写法与数组嵌套都不能
+// 改变元素对象被识别成的记录类别，两项检查由此始终按同一口径识别课程
+// 记录。
+//
+// 对象内 token 天然按键、值、键、值交替（逗号不产生 token），遍历器据此
+// 区分字符串 token 是键还是字符串值；嵌套对象/数组整体结束时也算外层键
+// 对应的值读完。限制只针对同一对象：每个对象独立成帧，数组各元素、不同
+// 课程或不同学生互不比较。
+//
+// 语法残缺（未闭合、值缺失等）不在本遍历的报错范围：returnSyntaxErr 为
+// false 时一律按“未发现本检查的问题”返回 nil，语法问题留给调用方随后的
+// 结构体解码阶段报告；为 true 时把 json.Decoder 的语法错误原样返回（调用
+// 方同样只从中识别自己的检查错误，其余仍交给解码阶段）。io.EOF（含空
+// 输入）两种模式下都返回 nil。
+func walkFirstRecordValue(r io.Reader, returnSyntaxErr bool, hooks recordTokenHooks) error {
 	type frame struct {
 		isObj bool
 		// kind 标识对象类型（决定有哪些可识别字段）；数组帧不用。
@@ -369,17 +248,13 @@ func scanDuplicateKeys(r io.Reader) error {
 		// elem 标识数组元素对象的类型（数组帧使用）。
 		elem objKind
 		// expectKey 仅对对象有意义：true 表示下一个字符串 token 是键
-		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。
-		// 对象内 token 天然按键、值、键、值交替（逗号不产生 token），
-		// 借此区分字符串 token 是键还是普通字符串值。
+		// （或直接遇到 '}'）；false 表示正在等待该键所对应的值。对象内
+		// token 天然按键、值、键、值交替（逗号不产生 token），借此区分
+		// 字符串 token 是键还是普通字符串值。
 		expectKey bool
-		// pendingKey 是当前值所属的键，用于判断嵌套对象/数组的类型。
+		// pendingKey 是当前值所属的键（解码后文字），用于判断嵌套对象/
+		// 数组的类型，并随标量值回调交给具体检查。
 		pendingKey string
-		// rawKeys 记录该对象内出现过的全部原始键名（解码后文字）。
-		rawKeys map[string]struct{}
-		// seen 记录每条可识别记录字段第一次出现时的原始写法，以规范
-		// 字段名为索引；无法识别的键不进此表。
-		seen map[string]string
 	}
 	var stack []frame
 	depth := 0
@@ -401,11 +276,10 @@ func scanDuplicateKeys(r io.Reader) error {
 				// 最外层五个字段之一决定）。
 				kind = stack[n-1].elem
 			}
-			stack = append(stack, frame{
-				isObj: true, kind: kind, expectKey: true,
-				rawKeys: map[string]struct{}{},
-				seen:    map[string]string{},
-			})
+			stack = append(stack, frame{isObj: true, kind: kind, expectKey: true})
+			if hooks.objectStart != nil {
+				hooks.objectStart(kind)
+			}
 		case '[':
 			elem := objUnknown
 			if n := len(stack); n > 0 {
@@ -440,7 +314,11 @@ func scanDuplicateKeys(r io.Reader) error {
 			return nil
 		}
 		if err != nil {
-			return err
+			if returnSyntaxErr {
+				return err
+			}
+			// 语法问题留给随后的结构体解码报告；本检查只负责自己的发现。
+			return nil
 		}
 		switch t := tok.(type) {
 		case json.Delim:
@@ -450,6 +328,14 @@ func scanDuplicateKeys(r io.Reader) error {
 				push(t)
 			case '}', ']':
 				depth--
+				cur := stack[len(stack)-1]
+				if t == '}' && hooks.objectEnd != nil {
+					// 出栈前汇总：课程编号等对象内信息此刻无论先后都已
+					// 到齐。
+					if err := hooks.objectEnd(cur.kind); err != nil {
+						return err
+					}
+				}
 				stack = stack[:len(stack)-1]
 				if depth == 0 {
 					// 唯一的顶层值已完整读完，其后内容不在本检查范围。
@@ -462,41 +348,195 @@ func scanDuplicateKeys(r io.Reader) error {
 			n := len(stack)
 			if n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
 				f := &stack[n-1]
-				// 对象键：Token() 已按解码后的文字返回，\uXXXX 转义
-				// 形式的键名与直接写出的同名键在这里完全不可区分。
-				if _, dup := f.rawKeys[t]; dup {
-					return &duplicateFieldError{field: t, first: t, second: t}
-				}
-				f.rawKeys[t] = struct{}{}
-				// 只有指向同一条可识别记录字段的不同写法才算归属
-				// 冲突；未知键的大小写变体随后由结构体解码按未知字段
-				// 拒绝（如 "foo" 与 "Foo" 不会被当成任何业务字段）。
-				if canonical, known := matchRecordField(f.kind, t); known {
-					if prev, conflict := f.seen[canonical]; conflict {
-						return &duplicateFieldError{
-							field:  canonical,
-							first:  prev,
-							second: t,
-						}
+				if hooks.key != nil {
+					if err := hooks.key(f.kind, t); err != nil {
+						return err
 					}
-					f.seen[canonical] = t
 				}
 				f.expectKey = false
 				f.pendingKey = t
 				continue
 			}
-			valueEnded()
+			// 字符串值：名称、依据等普通文字在这里出现，包括字面写出的
+			// "null" 与字段名，都只是文字。
+			if n > 0 && stack[n-1].isObj {
+				f := &stack[n-1]
+				if hooks.stringValue != nil {
+					if err := hooks.stringValue(f.kind, f.pendingKey, t); err != nil {
+						return err
+					}
+				}
+				valueEnded()
+			}
 			if depth == 0 {
 				return nil // 顶层标量值
 			}
 		default:
-			// number、bool、nil 等标量值。
-			valueEnded()
+			// number、bool 等标量值；JSON null 的 token 是无类型 nil。
+			if n := len(stack); n > 0 && stack[n-1].isObj {
+				f := &stack[n-1]
+				if hooks.scalarValue != nil {
+					if err := hooks.scalarValue(f.kind, f.pendingKey, tok); err != nil {
+						return err
+					}
+				}
+				valueEnded()
+			}
 			if depth == 0 {
 				return nil
 			}
 		}
 	}
+}
+
+// scanDuplicateKeys 扫描第一份完整 JSON 值的 token 流，在每个对象内检查
+// 字段归属唯一；第一份值之后的字节一律不读（调用方另行检查完整记录之后
+// 是否还拼接了多余内容，那里的报错信息需要与本检查区分开）。
+//
+// 背景：encoding/json 直接解进结构体（或 map）时，同一对象内的重复键会被
+// 后一个静默覆盖，而且结构体字段按大小写折叠匹配 json 标签（规则等同于
+// strings.EqualFold）——同一门课程同时写 "credit":4 与 "Credit":9 时，
+// 标准库读不出“曾经写过两个”，学分直接被后一个值顶替，两个键先后颠倒
+// 结果也随之颠倒。因此在正常结构体解码之前先单独扫描一遍 token 流。
+//
+// 检查只保留自己的发现规则，层次与类别推导全部复用 walkFirstRecordValue：
+//   - 同一个 JSON 对象内字段归属只能确定一次：完全同名的两个键，或两个
+//     键名在大小写折叠后都指向同一条可识别记录字段（如 credit 与
+//     Credit、student 与 Student、courses 与 COURSES），发现即返回
+//     *duplicateFieldError（含规范字段名与两个原始写法）。
+//   - 字段顺序、是否相邻、两个值是否相同都不影响判定。
+//   - 比较以 JSON 解码后的文字为准：Token() 返回的键名已完成 Unicode
+//     反转义，所以 "credit"、它的 \uXXXX 转义写法与 "Credit" 之间任意
+//     的两两组合都按解码后实际所指的字段判断，不能用转义加大小写的组合
+//     绕开限制。
+//   - 限制只针对同一对象：对象与数组可任意嵌套，数组各元素、不同课程或
+//     不同学生等不同对象各自携带同名字段是正常结构，互不比较。
+//   - 不能被读取功能识别的字段不参与折叠归并，但完全同名仍按重复拒绝；
+//     真正的未知字段留给随后的 DisallowUnknownFields 解码阶段拒绝。
+//   - 字符串“值”里出现字段名（依据、课程名称等）不是键，不参与检查。
+func scanDuplicateKeys(r io.Reader) error {
+	type dupState struct {
+		// rawKeys 记录该对象内出现过的全部原始键名（解码后文字）。
+		rawKeys map[string]struct{}
+		// seen 记录每条可识别记录字段第一次出现时的原始写法，以规范
+		// 字段名为索引；无法识别的键不进此表。
+		seen map[string]string
+	}
+	// 每个对象一份状态，随遍历器的 objectStart/objectEnd 成对压退，天然
+	// 只在同一对象内比较；数组不压状态，元素对象各自独立。
+	var states []dupState
+
+	hooks := recordTokenHooks{
+		objectStart: func(objKind) {
+			states = append(states, dupState{
+				rawKeys: map[string]struct{}{},
+				seen:    map[string]string{},
+			})
+		},
+		objectEnd: func(objKind) error {
+			states = states[:len(states)-1]
+			return nil
+		},
+		key: func(kind objKind, key string) error {
+			st := &states[len(states)-1]
+			// 对象键：Token() 已按解码后的文字返回，\uXXXX 转义形式的
+			// 键名与直接写出的同名键在这里完全不可区分。
+			if _, dup := st.rawKeys[key]; dup {
+				return &duplicateFieldError{field: key, first: key, second: key}
+			}
+			st.rawKeys[key] = struct{}{}
+			// 只有指向同一条可识别记录字段的不同写法才算归属冲突；
+			// 未知键的大小写变体随后由结构体解码按未知字段拒绝（如
+			// "foo" 与 "Foo" 不会被当成任何业务字段）。
+			if canonical, known := matchRecordField(kind, key); known {
+				if prev, conflict := st.seen[canonical]; conflict {
+					return &duplicateFieldError{
+						field:  canonical,
+						first:  prev,
+						second: key,
+					}
+				}
+				st.seen[canonical] = key
+			}
+			return nil
+		},
+	}
+	// 语法残缺由遍历器原样返回 json.Decoder 错误；Load 只按
+	// *duplicateFieldError 识别本检查的发现，其余错误仍交给解码阶段。
+	return walkFirstRecordValue(r, true, hooks)
+}
+
+// scanNullCourseOpen 扫描第一份完整 JSON 值的 token 流：只要某个课程对象
+// （courses 数组元素，含最外层键的大小写变体与数组嵌套）显式给出开放状态
+// 字段且值是 JSON null，就返回 *nullCourseOpenError。
+//
+// 与 scanDuplicateKeys 共用同一遍历与字段识别口径（见
+// walkFirstRecordValue 与 matchRecordField），今后调整记录结构时两项检查
+// 仍按同一口径识别课程记录：
+//   - 键名以 JSON 解码后的文字按 strings.EqualFold 与课程结构体的 open
+//     标签比较，open、Open、OPEN 以及解码后等同于这些写法的 \uXXXX 转义
+//     都指向同一状态字段，字段在课程对象中的位置不影响结果；
+//   - 只认“键后紧跟的值 token 就是 nil（JSON null）”这一种情形：字符串
+//     字面量 "null" 走字符串值回调，是普通文字，课程名称、免修依据里出现
+//     它不算状态空值；开放状态写成对象/数组等其他类型留给结构体解码按
+//     类型错误拒绝。
+//
+// 课程对象之外的 null 不由本检查处理：最外层的 null 或空数组继续按既有
+// 读取规则判读（顶层 null/数组本来就不是合法记录），"courses":null 这类
+// 空列表照常按没有课程读取。报错推迟到该课程对象完整读完时（objectEnd）
+// 发出，这样无论 id 字段出现在开放状态之前还是之后，错误都能点名课程
+// 编号。
+func scanNullCourseOpen(r io.Reader) error {
+	type openState struct {
+		// courseID 记录本课程对象已读到的编号，供报错时点名。
+		courseID string
+		// openNullKey 记录开放状态被写成 null 时该字段的原始写法；
+		// 非空表示本课程对象已构成损坏。
+		openNullKey string
+	}
+	// 每个对象一份状态，随遍历器的 objectStart/objectEnd 成对压退；只有
+	// 课程对象会写入其中字段。
+	var states []openState
+
+	hooks := recordTokenHooks{
+		objectStart: func(objKind) {
+			states = append(states, openState{})
+		},
+		objectEnd: func(kind objKind) error {
+			st := &states[len(states)-1]
+			var err error
+			if kind == objCourse && st.openNullKey != "" {
+				// 课程对象已完整读完，id 无论先后都已记录在案。
+				err = &nullCourseOpenError{courseID: st.courseID, key: st.openNullKey}
+			}
+			states = states[:len(states)-1]
+			return err
+		},
+		stringValue: func(kind objKind, key, value string) error {
+			// 字符串值：在课程对象内顺带记录编号；普通文字 "null" 走的
+			// 也是这里，绝不会被当成开放状态空值。
+			if kind == objCourse {
+				if canonical, ok := matchRecordField(objCourse, key); ok && canonical == "id" {
+					states[len(states)-1].courseID = value
+				}
+			}
+			return nil
+		},
+		scalarValue: func(kind objKind, key string, tok any) error {
+			if kind == objCourse && tok == nil {
+				if canonical, ok := matchRecordField(objCourse, key); ok && canonical == "open" {
+					st := &states[len(states)-1]
+					// 只记第一处；整份文件都会被拒绝，列出哪一门都成立。
+					if st.openNullKey == "" {
+						st.openNullKey = key
+					}
+				}
+			}
+			return nil
+		},
+	}
+	// 语法问题留给随后的结构体解码报告；本检查只负责发现 null 状态。
+	return walkFirstRecordValue(r, false, hooks)
 }
 
 // scanStringUnicode 按原始字节扫描第一份完整 JSON 值里的全部字符串
@@ -509,8 +549,8 @@ func scanDuplicateKeys(r io.Reader) error {
 // 替换成 U+FFFD（“�”）。替换后的学生编号、课程名称或免修依据绝不能被当成
 // 正常内容继续查询、核对或登记——两个本来不同的编号可能被替换成同一个
 // 而被误判重复或误判相同。因此必须在结构体解码之前按原始字节拒绝这样的
-// 文件，整份判为内容损坏，哪怕问题只在一条已拒绝免修的依据里、或在与本次
-// 核对无关的课程名称里。
+// 文件，整份判为内容损坏，哪怕问题只出现在一条已拒绝免修的依据里、或在与
+// 本次核对无关的课程名称里。
 //
 // 合法文字不受影响：中文、直接写入的补充平面字符、完整的高低代理项转义对、
 // 用转义表达的控制字符都保留原意；用户确实写入的“�”（U+FFFD，直接写出
