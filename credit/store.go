@@ -82,7 +82,8 @@ type Waiver struct {
 	ReqID     string       `json:"req"`
 	Basis     string       `json:"basis"`
 	Status    WaiverStatus `json:"status"`
-	// Reason 记录拒绝原因或撤销原因。
+	// Reason 记录拒绝原因或撤销原因。已拒绝的申请必须保留有实际
+	// 文字的拒绝原因（读取校验见 Load）；有效免修可以没有原因。
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -120,14 +121,20 @@ func dupKey(student, course string) ownerKey {
 	return ownerKey{student, course}
 }
 
-// blankBasis 报告一份免修依据是否不含任何实际文字：空字符串，或全部由空白
+// blankText 报告一段文字是否不含任何实际文字：空字符串，或全部由空白
 // 字符组成。空白按 Unicode 判定，除空格、制表符、换行、回车外还包括全角
-// 空格（U+3000）、不换行空格（U+00A0）等，混合使用这些字符仍算没有依据。
+// 空格（U+3000）、不换行空格（U+00A0）等，混合使用这些字符仍算没有文字。
 //
-// 该判定只用于读取校验，绝不修剪或改写已保存的依据原文——依据中含有实际
-// 文字时，其前后与中间原有的空白必须原样保留在免修历史中。
+// 该判定只用于读取校验，绝不修剪或改写已保存的原文——文字中含有实际
+// 内容时，其前后与中间原有的空白必须原样保留在记录中。
+func blankText(s string) bool {
+	return strings.TrimSpace(s) == ""
+}
+
+// blankBasis 报告一份免修依据是否不含任何实际文字，判定口径与
+// blankText 完全一致（见该函数）。
 func blankBasis(basis string) bool {
-	return strings.TrimSpace(basis) == ""
+	return blankText(basis)
 }
 
 func newStore() *Store {
