@@ -578,6 +578,58 @@ func (s *Store) validateResultSeqUniqueness() error {
 	return nil
 }
 
+// duplicateApprovedWaiverError 表示待保存记录中同一学生名下的同一要求被两份
+// 不同编号、状态为有效的免修同时取代。student 是所属学生编号，req 是目标要求
+// 编号，first/second 是冲突的两份免修编号（按免修在记录中的先后，first 先
+// 出现），便于调用方定位具体申请。
+type duplicateApprovedWaiverError struct {
+	student string
+	req     string
+	first   string
+	second  string
+}
+
+func (e *duplicateApprovedWaiverError) Error() string {
+	return fmt.Sprintf(
+		"学生 %s 的要求 %s 同时存在两份有效免修 %s 与 %s（同一要求只能被一份有效免修取代）",
+		e.student, e.req, e.first, e.second)
+}
+
+// validateApprovedWaiverUniqueness 检查同一学生名下的同一要求至多被一份有效
+// 免修取代。
+//
+// 正常申请流程会用 validWaiver 挡住第二份有效免修，读取记录文件时 loadData
+// 也会拒绝这类冲突；但调用方取得免修记录后可以直接修改其内容——把另一份
+// 申请改成有效，或把一份有效申请的目标改到已经由免修满足的要求——绕过这
+// 两道关口。这样的记录一旦落盘，原本可用的文件就变成之后无法读取的文件，
+// 因此保存前必须做与读取一致的检查：同一（学生，要求）下有两份不同编号、
+// 状态为有效的免修时整次拒绝保存。判定只按所属学生与目标要求的完整编号
+// （沿用 reqKey 的现有编号匹配规则，编号前后的空白也是编号内容，绝不修剪
+// 合并）；两份申请的依据即使相同也是两份不同免修，该要求另有通过修读、
+// 已经能获得学分也不能掩盖冲突，冲突申请之间夹着其他合法历史结论相同。
+// 已拒绝、已撤销的失效申请不占用有效名额，照常共存。检查只读不写：不删除
+// 申请，不替调用方选定一份有效免修，也不改状态、目标要求或依据。
+func (s *Store) validateApprovedWaiverUniqueness() error {
+	approved := map[ownerKey]*Waiver{} // (student, req) -> 首份有效免修
+	for _, w := range s.waivers {
+		if w == nil || w.Status != WaiverApproved {
+			// 失效申请（已拒绝/已撤销）不占用有效名额，不参与冲突判定。
+			continue
+		}
+		key := reqKey(w.StudentID, w.ReqID)
+		if prev := approved[key]; prev != nil {
+			return &duplicateApprovedWaiverError{
+				student: w.StudentID,
+				req:     w.ReqID,
+				first:   prev.ID,
+				second:  w.ID,
+			}
+		}
+		approved[key] = w
+	}
+	return nil
+}
+
 // checkSaveText 校验单个待保存字段的文字是否为合法 UTF-8。
 func checkSaveText(category, id, field, value string) error {
 	if !utf8.ValidString(value) {
@@ -607,12 +659,28 @@ func checkSaveText(category, id, field, value string) error {
 // 记录文件也不遗留临时文件；待保存的内存记录同样原样保留——不删修读、
 // 不替调用方调整顺序、不清成绩或免修历史。仍是选课、尚未提交结果的修读
 // 沿用编号 0，多份并存不构成重复；已提交编号有空缺（不连续）仍合法。
+//
+// 三是同一学生名下的同一要求至多被一份有效免修取代：正常申请流程与记录
+// 文件读取都拒绝同一要求并存两份有效免修，但调用方取得免修记录后可以
+// 直接修改其内容（把另一份申请改成有效，或把有效申请的目标改到已由免修
+// 满足的要求），绕过这两道关口。这样的记录落盘后，原本可用的文件就变成
+// 之后无法读取的文件，因此写入时同样拒绝：错误点名目标文件、所属学生、
+// 要求编号与冲突的两份免修编号，已有文件全部内容原样保留，目标原本不
+// 存在时不创建记录文件也不遗留临时文件；待保存的内存记录保持提交时的
+// 内容——不删除申请，不替调用方选定一份有效免修，也不改状态、目标要求
+// 或依据。判定只按所属学生与目标要求的完整编号（编号前后的空白也是编号
+// 内容）；两份申请依据相同仍算两份免修，该要求另有通过修读也不能掩盖
+// 冲突；已拒绝、已撤销的失效申请不占用有效名额。调用方消除冲突后可继续
+// 使用本保存功能。
 func (s *Store) Save(path string) (err error) {
 	if err := s.validateSaveText(); err != nil {
 		return fmt.Errorf("记录中存在无法原样保存的文字，拒绝写入 %s：%w", path, err)
 	}
 	if err := s.validateResultSeqUniqueness(); err != nil {
 		return fmt.Errorf("记录中的成绩提交顺序编号冲突，拒绝写入 %s，已有文件保持原样：%w", path, err)
+	}
+	if err := s.validateApprovedWaiverUniqueness(); err != nil {
+		return fmt.Errorf("记录中存在有效免修冲突，拒绝写入 %s，已有文件保持原样：%w", path, err)
 	}
 	data := fileData{
 		Version:       recordVersion,
